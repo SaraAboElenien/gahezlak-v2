@@ -1,0 +1,20 @@
+# Normalize line endings on commit so CI (Linux) and dev machines (Windows)
+# agree on file contents — otherwise Prettier/ESLint format checks fail in CI
+# on files that are byte-identical apart from CRLF.
+* text=auto eol=lf
+
+# Binary assets: never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.pdf binary
+
+# Lockfiles are generated — collapse them in diffs/reviews.
+package-lock.json linguist-generated=true -diff

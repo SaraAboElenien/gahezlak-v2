@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+build/
+*.tsbuildinfo
+
+# Environment — never commit real credentials.
+# .env.development is committed on purpose: it holds only the local API URL
+# and the frontend Sentry DSN. A frontend DSN is public by design — Vite
+# inlines it into the shipped bundle, so it is visible to anyone loading the
+# site and is not a secret. Backend secrets live in backend/.env, which is
+# ignored (see backend/.gitignore) — never add one here.
+.env
+.env.*
+!.env.development
+!.env.example
+
+# Internal engineering docs — kept on disk, deliberately not published.
+# They record internal reasoning, audit findings, unfixed weaknesses and test
+# credentials, none of which belong in a public repository. README.md and the
+# per-package READMEs are the public documentation; .github/*.md is GitHub
+# tooling (the PR template), not documentation, and stays.
+/CHANGELOG.md
+/CLAUDE.md
+/DECISIONS.md
+/DEPLOYMENT.md
+/KNOWN_ISSUES.md
+/PROJECT_AUDIT.md
+/PROJECT_IMPLEMENTATION_INSTRUCTIONS.md
+/REFACTOR_LOG.md
+/SECURITY.md
+/TECH_DEBT.md
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Local scratch / tooling output
+*.local
+.todo
+postman*
+eslint-errors.txt
+coverage/
+.vercel/

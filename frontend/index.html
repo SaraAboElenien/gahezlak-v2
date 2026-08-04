@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" class="light" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/qr-hand.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gahezlak — Digital Menus & Ordering for Restaurants</title>
+    <meta
+      name="description"
+      content="Gahezlak is a digital menu and ordering platform for restaurants and shops: QR-code menus, real-time order management, and a full shop dashboard."
+    />
+    <meta name="robots" content="index, follow" />
+
+    <!-- These static tags are the ones non-JS crawlers and social-share
+         scrapers (Facebook/Twitter/LinkedIn link previews) actually see,
+         since this is a client-rendered SPA and they don't execute JS.
+         react-helmet-async (src/components/Seo.tsx) overrides these
+         per-route for browsers and JS-executing crawlers, but can't help
+         here — see CLAUDE.md for the SSR/prerender discussion. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Gahezlak" />
+    <meta
+      property="og:title"
+      content="Gahezlak — Digital Menus & Ordering for Restaurants"
+    />
+    <meta
+      property="og:description"
+      content="Gahezlak is a digital menu and ordering platform for restaurants and shops: QR-code menus, real-time order management, and a full shop dashboard."
+    />
+    <meta property="og:image" content="/Logo.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta
+      name="twitter:title"
+      content="Gahezlak — Digital Menus & Ordering for Restaurants"
+    />
+    <meta
+      name="twitter:description"
+      content="Gahezlak is a digital menu and ordering platform for restaurants and shops: QR-code menus, real-time order management, and a full shop dashboard."
+    />
+    <meta name="twitter:image" content="/Logo.png" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

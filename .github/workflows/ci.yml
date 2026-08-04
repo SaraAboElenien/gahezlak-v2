@@ -1,0 +1,135 @@
+name: CI
+
+# This repo is a monorepo of two *independent* npm packages (`backend/`, `frontend/`)
+# with no root workspace, so each gets its own job, its own working-directory and its
+# own npm cache keyed on its own lockfile. The jobs are independent and run in parallel.
+#
+# NOTE: there is deliberately NO deploy job here. Both packages are deployed by Render,
+# which watches this repo itself (`autoDeploy: true` per service in the root render.yaml)
+# and runs its own build. Adding a deploy step to this workflow would create a second,
+# competing deploy path and cause duplicate/racing deployments. Do not add one.
+#
+# What this workflow *is* for: catching a broken build before Render tries it. Both jobs
+# below run the exact commands Render's buildCommand runs (`npm ci` + `npm run build`),
+# so a red CI run means a red deploy.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: CI only ever needs to read the repository.
+permissions:
+  contents: read
+
+# Superseded runs on the same branch/PR are pointless — cancel them.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned to 22 to match the machine every verification in this project has actually
+  # been performed on, and the `engines` field both packages declare — so CI reproduces
+  # local and production rather than testing a runtime nobody has run this code on.
+  # (`@types/node` is ^24, but that's the type surface, not the runtime.) Node 24 is the
+  # newer Active LTS and moving to it is worth doing deliberately: bump `.nvmrc`, both
+  # `engines` fields, and this value together, then re-run the suites locally.
+  NODE_VERSION: "22"
+
+jobs:
+  backend:
+    name: Backend (typecheck, lint, test, build)
+    runs-on: ubuntu-latest
+    # The backend suite boots a real `mongod` via mongodb-memory-server; generous but
+    # bounded so a hung/stuck download fails the job instead of burning the 6h default.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # mongodb-memory-server downloads a real mongod binary on first use. Left to its
+      # defaults it lands inside node_modules (blown away by every `npm ci`) and is
+      # re-downloaded on every run — slow and a genuine source of CI flakiness.
+      # Point it at a stable, cacheable directory outside node_modules instead.
+      MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      # Restore the mongod binary itself. The key includes the backend lockfile hash so
+      # bumping mongodb-memory-server (which may change the default mongod version)
+      # naturally invalidates the cache; the restore-keys prefix lets an otherwise
+      # unrelated lockfile change still reuse the existing binary.
+      - name: Cache mongodb-memory-server binary
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('backend/package-lock.json') }}
+          restore-keys: |
+            mongodb-binaries-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npx eslint .
+
+      - name: Test
+        run: npm test
+
+      # Same command Render's buildCommand runs (`tsc` -> dist/). The typecheck
+      # step above is --noEmit, which can pass while a real emit fails (e.g. an
+      # output path collision), and dist/server.js is what Render's startCommand
+      # actually executes — so prove it gets produced here rather than in a
+      # failed deploy.
+      - name: Build
+        run: npm run build
+
+  frontend:
+    name: Frontend (typecheck, lint, test, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `tsc -b` walks tsconfig.json's project references — tsconfig.app.json
+      # (the SPA), tsconfig.node.json (vite config) and tsconfig.server.json
+      # (the Express server under server/, which replaced the old Vercel Edge
+      # Middleware and tsconfig.vercel.json). All three are covered by this one
+      # command; do not add per-project steps.
+      - name: Typecheck
+        run: npx tsc -b --noEmit
+
+      - name: Lint
+        run: npx eslint .
+
+      - name: Test
+        run: npm test
+
+      # Same command Render's buildCommand runs. VITE_API_URL is deliberately
+      # NOT set here: Vite inlines it at build time, so a value baked in by CI
+      # would be meaningless (this artifact is never deployed — Render rebuilds
+      # from source with its own environment). The build succeeds without it;
+      # src/config/api.ts only logs at runtime when it is missing.
+      - name: Build
+        run: npm run build

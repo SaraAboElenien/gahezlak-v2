@@ -1,0 +1,43 @@
+# Public routes (landing page, restaurant menu/ordering flow) are crawlable.
+# Everything behind auth (dashboard, admin-dashboard, the auth flow itself)
+# is disallowed here as a defense-in-depth measure — it's already gated by
+# real auth, and the layouts also send a per-page noindex meta tag, but
+# there's no reason to invite crawler traffic at those paths at all.
+User-agent: *
+Disallow: /auth
+Disallow: /dashboard
+Disallow: /admin-dashboard
+Allow: /
+
+# /sitemap.xml is not a static file — it is generated on demand by the
+# frontend's own Express server (frontend/server/app.ts, route "/sitemap.xml"),
+# which calls the backend to enumerate every real shop so each one's
+# /shops/:slug and /shops/:slug/menu page is listed, not just "/".
+# (This replaced the old Vercel Function + vercel.json rewrite when the app
+# moved to Render.)
+#
+# =============================================================================
+# !! ACTION REQUIRED: EDIT THE `Sitemap:` LINE BELOW BEFORE GOING LIVE !!
+# =============================================================================
+# robots.txt is a STATIC file. It is copied verbatim from public/ into dist/ by
+# `vite build` and served as-is; it cannot read SITE_URL or any other env var,
+# and the sitemap URL must be absolute (relative Sitemap: values are not part
+# of the spec and crawlers ignore them). So this one URL has to be hardcoded,
+# and it is the only place in the app where the public origin is hardcoded.
+#
+# Replace the placeholder below with the frontend's REAL public origin:
+#   * On Render's default domain: https://<your-frontend-service>.onrender.com
+#     (e.g. https://gahezlak-web.onrender.com — confirm the actual name in the
+#     Render dashboard; Render appends a suffix if the name was taken)
+#   * Once a custom domain is attached: use that instead, and keep it identical
+#     to the SITE_URL env var on the frontend service (render.yaml). If the two
+#     disagree, this file advertises one origin while the sitemap's own <loc>
+#     entries claim another, and Google treats that as an untrusted sitemap and
+#     ignores it.
+#
+# A wrong or stale value here is silent — nothing fails, the sitemap is just
+# never discovered. It is safe to delete the `Sitemap:` line entirely if you
+# would rather submit the sitemap through Google Search Console; crawlers also
+# probe /sitemap.xml at the root by convention.
+# =============================================================================
+Sitemap: https://REPLACE-WITH-YOUR-DOMAIN.example.com/sitemap.xml

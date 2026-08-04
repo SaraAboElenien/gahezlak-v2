@@ -1,0 +1,22 @@
+# Generated / vendored
+node_modules/
+dist/
+dist-ssr/
+build/
+coverage/
+*.tsbuildinfo
+package-lock.json
+
+# NOTE: the former `.vercel/` entry was dropped with the move to Render.
+# Render builds entirely on its side and leaves no local artefact directory,
+# so there is nothing deploy-related left to ignore here. `render.yaml` at the
+# repo root is intentionally NOT ignored — it is normal YAML and should be
+# formatted like everything else.
+
+# Large hand-written governance docs at the repo root. Reformatting these would
+# produce enormous, meaningless diffs and bury real changes in review.
+/*.md
+
+# Backend/frontend READMEs are scaffold-generated; leave them alone too.
+backend/README.md
+frontend/README.md

@@ -1,0 +1,70 @@
+version: 2
+
+# Grouping is deliberate: without it, three separate npm ecosystems in one repo will
+# happily open 30+ PRs a week. Everything non-major is batched into one PR per package
+# per week; majors are split out individually so they get a real review.
+updates:
+  - package-ecosystem: npm
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(backend deps)"
+    groups:
+      backend-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+      backend-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(frontend deps)"
+    groups:
+      frontend-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+      frontend-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # Root package.json is tooling only (prettier/husky/lint-staged).
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(tooling deps)"
+    groups:
+      root-tooling:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(actions)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

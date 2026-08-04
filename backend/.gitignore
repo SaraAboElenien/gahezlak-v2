@@ -1,0 +1,19 @@
+# Never commit real credentials. `.env*` is deliberately broad, but
+# `.env.example` is the documented reference for every variable this service
+# reads (DEPLOYMENT.md and README.md both point at it) and holds no values —
+# without this negation it was silently uncommittable.
+.env*
+!.env.example
+
+# Scratch/probe scripts. `tsconfig.json`'s include is `./**/*.ts`, so anything
+# left at the backend root also gets compiled into dist/ and shipped.
+tmp-*.ts
+
+node_modules
+.vscode
+
+.todo
+
+dist
+
+postman*

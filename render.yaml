@@ -1,0 +1,356 @@
+# =============================================================================
+# Render Blueprint — Gahezlak
+# =============================================================================
+# Defines BOTH deployable services in this monorepo. Point Render at this file
+# (Dashboard -> Blueprints -> New Blueprint Instance, pick this repo) and it
+# creates/updates both services together.
+#
+# ARCHITECTURE
+# ------------
+#   gahezlak-api  — Express + TypeScript API. Compiled with `tsc` to
+#                   backend/dist/, started from backend/dist/server.js.
+#                   `backend/app.ts` only builds and exports the Express app
+#                   (no side effects); `backend/server.ts` is the entrypoint
+#                   that binds process.env.PORT on 0.0.0.0.
+#
+#   gahezlak-web  — The Vite SPA, served by a small Express server
+#                   (frontend/server/index.ts -> frontend/server/app.ts).
+#                   NOT a Render Static Site: the server does per-shop SEO
+#                   <head> injection on /shops/* and serves a dynamic
+#                   /sitemap.xml, both by calling the API at runtime. A static
+#                   site cannot do either.
+#
+# Neither service is an npm workspace member — backend/ and frontend/ are fully
+# independent packages with their own lockfiles, hence `rootDir` per service
+# and `npm ci` (not `npm install`) in each build.
+#
+# Node version: not pinned here. Both package.json files declare
+# `engines: { node: "22.x" }` and .nvmrc says 22, which Render honours. Keep
+# those three in sync rather than adding a NODE_VERSION var to this file.
+#
+# PLAN: both services are on `free`, which is fine for validating the
+# migration but has two consequences worth knowing before relying on it:
+#   * Instances spin down after ~15 minutes idle and cold-start on the next
+#     request (tens of seconds). That hits crawlers fetching /sitemap.xml or a
+#     shop's SEO <head>, and it delays Paymob's webhook POSTs — Paymob may time
+#     out and give up, which reproduces the "order stays Pending" symptom for a
+#     completely different reason.
+#   * Free services have no static outbound IPs (see the MONGODB_URI note).
+# Change `plan:` on both services to `starter` (or higher) to remove both.
+#
+# -----------------------------------------------------------------------------
+# READ THIS BEFORE THE FIRST DEPLOY — THE CHICKEN-AND-EGG PROBLEM
+# -----------------------------------------------------------------------------
+# The two services reference each other's public URLs:
+#
+#   gahezlak-api  needs  FRONTEND_URL   = https://gahezlak-web.onrender.com
+#                        (CORS allowlist — see backend/app.ts. An exact origin
+#                        match, so scheme matters and no trailing slash.)
+#
+#   gahezlak-web  needs  VITE_API_URL   = https://gahezlak-api.onrender.com/api/v1
+#                        (baked into the SPA bundle at BUILD time *and* read by
+#                        the SEO/sitemap server at RUNTIME. frontend/server/
+#                        index.ts exits at boot if it is unset.)
+#
+# Neither URL exists until Render has created the service, so the first deploy
+# cannot know them. Resolve it like this:
+#
+#   1. Create the Blueprint. Render prompts for every `sync: false` var below.
+#      For the two cross-reference vars, guess the URLs from the service names
+#      you are about to create — Render's default hostname is
+#      https://<service-name>.onrender.com, so with the names in this file:
+#          FRONTEND_URL = https://gahezlak-web.onrender.com
+#          VITE_API_URL = https://gahezlak-api.onrender.com/api/v1
+#      (If a name is already taken globally Render appends a suffix, e.g.
+#      gahezlak-api-a1b2 — that is the case step 3 exists for.)
+#   2. Let both services deploy. Note each service's real URL from its
+#      dashboard page.
+#   3. If either differs from your guess, correct the value in that service's
+#      Environment tab and redeploy it. The frontend MUST be redeployed (not
+#      just restarted) if VITE_API_URL changed, because the SPA bundle has the
+#      old value compiled into it.
+#   4. Verify:  curl https://<api>/health    -> {"status":"ok","db":"connected"}
+#               curl https://<web>/healthz   -> {"status":"ok"}
+#
+# WHY NOT `fromService` HERE?
+# Render's blueprint syntax does support cross-service references:
+#
+#     - key: SOME_VAR
+#       fromService:
+#         type: web
+#         name: gahezlak-api
+#         property: host        # or `port` / `hostport`
+#
+# but the only properties it exposes are host/port/hostport — a bare hostname
+# like `gahezlak-api.onrender.com`. It cannot prepend a scheme or append a
+# path, and both of our vars need exactly that (`https://...` for the CORS
+# origin comparison, `https://.../api/v1` for the API base). There is no string
+# interpolation in blueprint env values, so `fromService` cannot express either
+# one. They are therefore plain `sync: false` vars, set once by hand.
+# If the backend is ever changed to accept a bare host for CORS, FRONTEND_URL
+# could switch to the `fromService` form above.
+#
+# -----------------------------------------------------------------------------
+# ABOUT `sync: false`
+# -----------------------------------------------------------------------------
+# Every secret and every environment-specific value below is declared with
+# `sync: false`. That means: "this variable exists, but its value is NOT in
+# git — prompt for it / keep whatever is set in the dashboard." Render will ask
+# for each one on first Blueprint sync and will never overwrite it afterwards.
+# Only genuinely non-secret, deploy-invariant values (NODE_ENV) are hardcoded.
+#
+# Vars marked "optional" can be left blank at the prompt; the code no-ops or
+# lazily fails only when that feature is actually used. Blank is a real answer.
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # Backend API
+  # ===========================================================================
+  - type: web
+    name: gahezlak-api
+    runtime: node
+    # Both services should share a region so cross-service calls (the SEO
+    # server hitting the API) stay on Render's internal network path. Frankfurt
+    # is the closest region to the users and to the MongoDB Atlas cluster;
+    # change both services together if you move.
+    region: frankfurt
+    plan: free
+    rootDir: backend
+    # `npm ci` (not install) so the lockfile is authoritative. `npm run build`
+    # is `tsc`, which emits to backend/dist/.
+    buildCommand: npm ci && npm run build
+    # `npm start` is `node --env-file-if-exists=.env dist/server.js`. There is
+    # no .env file in a Render container — the flag is the "if-exists" variant
+    # precisely so it is a no-op here and Render's own environment is used.
+    startCommand: npm start
+    # backend/routes/health.routes.ts -> {"status":"ok","db":"connected"}.
+    # Render polls this and will not route traffic to an instance failing it.
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # --- Required: config/env-validation.ts throws at import if any is unset,
+      # --- which on Render surfaces as a failed deploy, not a silent misconfig.
+
+      # MongoDB Atlas connection string.
+      # IMPORTANT: Render's outbound IPs are dynamic on the free/starter plans.
+      # Atlas's IP Access List must allow 0.0.0.0/0, or you must upgrade to a
+      # plan with static outbound IPs and allowlist those. Historically this
+      # project's allowlist only ever contained the developer's own IP — that
+      # will make /health report "db":"disconnected" here.
+      - key: MONGODB_URI
+        sync: false
+
+      # Signs/verifies access + refresh JWTs. middlewares/auth.ts also fails
+      # fast at module load without it. Use a long random string.
+      # Alternative: replace `sync: false` with `generateValue: true` to have
+      # Render mint one. Not the default here because rotating it logs out
+      # every existing session, and you may want to reuse an existing secret.
+      - key: JWT_SECRET
+        sync: false
+
+      # The frontend origin allowed through CORS. Exact-match, so:
+      # scheme included, NO trailing slash, NO path.
+      # See the chicken-and-egg note at the top of this file.
+      #   -> https://gahezlak-web.onrender.com
+      - key: FRONTEND_URL
+        sync: false
+
+      # --- Runtime -------------------------------------------------------
+      # Not a secret and never differs per deploy, so it lives in git.
+      # Also switches auth cookies to Secure/SameSite=None and drops the
+      # localhost CORS allowances.
+      - key: NODE_ENV
+        value: production
+
+      # NOTE: PORT is deliberately absent. Render injects it and server.ts
+      # binds it on 0.0.0.0. Setting it here would fight the platform.
+
+      # bcrypt cost factor. Optional — defaults to 10 (config/bcrypt.ts).
+      - key: BCRYPT_SALT_ROUNDS
+        sync: false
+
+      # --- Email (OTP verification + password reset) ---------------------
+      # These two are the only non-ALL_CAPS vars in the project:
+      # utils/send-email.ts reads process.env.sendEmail / process.env.
+      # emailPassword verbatim. Render env var keys are case-sensitive —
+      # type them exactly as written or email silently breaks.
+      - key: sendEmail
+        sync: false
+      - key: emailPassword
+        sync: false
+
+      # --- Image hosting -------------------------------------------------
+      # Required in practice for ANY shop creation, not just logo uploads:
+      # createShopHandler unconditionally generates and uploads a QR code, so
+      # shop creation 500s without a real key.
+      - key: IMGBB_KEY
+        sync: false
+
+      # --- Paymob (payments + subscriptions) -----------------------------
+      # Optional at boot; each is validated only when that payment path runs.
+      - key: PAYMOB_API_KEY
+        sync: false
+      - key: PAYMOB_SECRET_KEY
+        sync: false
+      - key: PAYMOB_PUBLIC_KEY
+        sync: false
+      - key: PAYMOB_HMAC_SECRET
+        sync: false
+      # Card/3DS. Used for card orders AND for the first transaction of a
+      # subscription with no free trial.
+      - key: PAYMOB_DEFAULT_INTEGRATION_ID
+        sync: false
+      # MOTO. Only ever the subscription *plan's* integration — Paymob runs
+      # the recurring deductions through it. No plan can be created without
+      # it. The LIVE id additionally requires Paymob Risk Approval.
+      - key: PAYMOB_MOTO_INTEGRATION_ID
+        sync: false
+      # Verification/auth. The first transaction of a FREE-TRIAL subscription
+      # runs through this so the amount is authorised and auto-voided rather
+      # than charged. If this is missing, trial signups 422; if it is set to
+      # the card integration by mistake, trial signups are charged the full
+      # plan price and nothing errors. See ADR-015.
+      - key: PAYMOB_VERIFICATION_INTEGRATION_ID
+        sync: false
+      # Mobile wallets (Vodafone Cash / Orange Money / Etisalat). Wired up on
+      # the backend as of 2026-08-05, but not yet offered in the cart UI.
+      - key: PAYMOB_WALLET_INTEGRATION_ID
+        sync: false
+      # NOT READ BY ANY CODE. The app's "Cash" means pay in person and skips
+      # Paymob entirely (ADR-015); Paymob's own Cash Collection product is a
+      # different thing and isn't supported on Unified Checkout. Listed only
+      # so the id isn't rediscovered from scratch if that changes.
+      - key: PAYMOB_CASH_INTEGRATION_ID
+        sync: false
+
+      # Server-to-server callbacks Paymob POSTs payment results to. They must
+      # be PUBLICLY reachable — this deploy is the first time they realistically
+      # can be, since localhost never worked. Set them to this service's own
+      # public URL plus the mounted webhook paths (see routes/webhooks.routes.ts):
+      #   ORDER_WEBHOOK_URL        = https://gahezlak-api.onrender.com/api/v1/webhooks/paymob/orders
+      #   SUBSCRIPTION_WEBHOOK_URL = https://gahezlak-api.onrender.com/api/v1/webhooks/paymob/subscriptions
+      # Leaving them blank is why paid orders stay "Pending" forever
+      # (KNOWN_ISSUES.md). Nothing fails at boot when they are missing, so this
+      # bug deploys silently — fill them in.
+      - key: ORDER_WEBHOOK_URL
+        sync: false
+      - key: SUBSCRIPTION_WEBHOOK_URL
+        sync: false
+
+      # --- Error monitoring ----------------------------------------------
+      # Optional; config/sentry.ts no-ops entirely when unset. Must be the FULL
+      # DSN URL from Sentry (Settings -> Projects -> Client Keys), not just the
+      # public key.
+      - key: SENTRY_DSN
+        sync: false
+      # Optional, and normally LEAVE THIS UNSET. config/sentry.ts already
+      # derives the release from RENDER_GIT_COMMIT, which Render injects
+      # automatically — and frontend/vite.config.ts derives it the same way.
+      # Setting it here but not on the frontend would tag the two services with
+      # different releases for the same deploy, which is worse than not tagging
+      # at all: a single incident then appears split across two versions.
+      # Only set it (on BOTH services) to override with something like a
+      # semantic version.
+      - key: SENTRY_RELEASE
+        sync: false
+
+      # --- AI features (menu OCR, enrichment, search) --------------------
+      # config/claude.ts builds its client lazily, so a blank value here does
+      # not block boot — the AI routes return a clear "not configured" error
+      # and every other route is unaffected.
+      #
+      # These routes are the only ones that spend money on a third-party
+      # account per request, and /ai/menu/super-search is public by necessity.
+      # The whole router is rate-limited (15 requests / 5 min per IP, counters
+      # shared through MongoDB so they survive restarts and extra instances).
+      # If you scale this service up, that limit stays global — it does not
+      # multiply per instance.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Optional. Defaults to claude-opus-5.
+      - key: AI_MODEL
+        sync: false
+      # Optional, defaults to 8000. Caps thinking and response together.
+      - key: AI_MAX_TOKENS
+        sync: false
+
+  # ===========================================================================
+  # Frontend (SPA + SEO/sitemap server)
+  # ===========================================================================
+  - type: web
+    name: gahezlak-web
+    runtime: node
+    region: frankfurt
+    plan: free
+    rootDir: frontend
+    # `npm run build` is `tsc -b && vite build` -> frontend/dist/.
+    # VITE_API_URL must be present during THIS command as well as at runtime:
+    # Vite inlines import.meta.env.VITE_* into the bundle at build time. Render
+    # exposes the service's env vars to the build, so declaring it below covers
+    # both — but it does mean changing it requires a rebuild, not a restart.
+    buildCommand: npm ci && npm run build
+    # `npm start` is `tsx server/index.ts`. tsx and express are runtime
+    # dependencies (not devDependencies) precisely so this works after a
+    # production install.
+    startCommand: npm start
+    # frontend/server/app.ts -> {"status":"ok"}. Deliberately static: it does
+    # not touch the backend, so an API outage cannot take this service down
+    # too.
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # Backend API base URL, INCLUDING the /api/v1 path.
+      # Required — server/index.ts calls process.exit(1) at boot if unset, and
+      # the SPA logs a console error and falls back to a same-origin relative
+      # path (which fails visibly rather than hitting the wrong backend).
+      # See the chicken-and-egg note at the top of this file.
+      #   -> https://gahezlak-api.onrender.com/api/v1
+      - key: VITE_API_URL
+        sync: false
+
+      # Canonical public origin used for <loc> in /sitemap.xml, og:url, and the
+      # canonical link on per-shop pages. Optional: when unset the server falls
+      # back to the request's own protocol + Host, which is correct on
+      # *.onrender.com. Set it as soon as a custom domain exists, otherwise
+      # every canonical URL will point at the onrender.com hostname instead.
+      # No trailing slash.
+      - key: SITE_URL
+        sync: false
+
+      # Shows or hides the AI menu UI (customer search + dashboard OCR tab).
+      # Leave unset/false unless ANTHROPIC_API_KEY is set AND the account is
+      # funded — the two must agree. This alone gives a UI whose requests 406;
+      # the key alone leaves working endpoints with no way in from the UI.
+      # Build-time value, so flipping it needs a rebuild, not a restart.
+      - key: VITE_AI_ENABLED
+        sync: false
+
+      # Optional frontend Sentry DSN. Baked into the bundle at build time
+      # (VITE_ prefix), so changing it needs a rebuild. Full DSN URL, not the
+      # bare public key. Inert when blank.
+      - key: VITE_SENTRY_DSN
+        sync: false
+
+      # Source-map upload, so production stack traces are readable instead of
+      # minified. All three are needed together — vite.config.ts skips upload
+      # entirely unless every one is set.
+      #
+      # The trap: a missing token does NOT fail the build. It logs a warning
+      # and ships, so the only symptom is unreadable traces in Sentry weeks
+      # later. Check after the first deploy that the release actually has
+      # artifacts attached rather than assuming it worked.
+      #
+      # SENTRY_ORG is the org *slug*, not the numeric ID.
+      - key: SENTRY_AUTH_TOKEN
+        sync: false
+      - key: SENTRY_ORG
+        sync: false
+      - key: SENTRY_PROJECT
+        sync: false
+
+      # NODE_ENV is intentionally NOT set here. `vite build` always produces a
+      # production bundle regardless, and the Express server has no
+      # NODE_ENV-dependent behaviour — while setting it to "production" would
+      # make some npm versions skip devDependencies during `npm ci`, breaking
+      # the `tsc -b` step of the build.

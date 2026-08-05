@@ -122,12 +122,15 @@ export async function GetOrdersByShop({
   skip: number;
   limit: number;
 }) {
-  const orders = await Orders.find(
-    { shopId },
-    {
-      shopId: 0,
-    },
-  )
+  // `query` must reach both calls, or a filtered request returns every row
+  // while totalCount reports the filtered figure. `shopId` is spread last in
+  // both so a caller-supplied filter can never widen the scope past its own
+  // shop.
+  const filter = { ...query, shopId };
+
+  const orders = await Orders.find(filter, {
+    shopId: 0,
+  })
     .populate({
       path: "orderItems.menuItem",
       select: "name price options imgUrl discountPercentage",
@@ -136,7 +139,7 @@ export async function GetOrdersByShop({
     .limit(limit)
     .sort({ createdAt: -1 })
     .lean();
-  const totalCount = await Orders.countDocuments({ shopId, ...query });
+  const totalCount = await Orders.countDocuments(filter);
 
   return { orders, totalCount };
 }

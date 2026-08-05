@@ -64,9 +64,27 @@ const allowedOrigins = [
 app.use(helmet());
 app.use(
   cors({
+    // This callback is load-bearing for CSRF, not just CORS — do not
+    // "simplify" it to `origin: allowedOrigins`.
+    //
+    // Passing an array makes the cors package merely *omit* the response
+    // headers for a disallowed origin: the request still reaches the handler
+    // and its side effects still happen, which is the usual and correct
+    // caveat that CORS is not a CSRF defence. Rejecting here instead means
+    // the request is refused before routing, which makes this a genuine
+    // server-side origin check. That is what stops a third-party page from
+    // force-submitting the httpOnly refresh cookie to POST /auth/refresh or
+    // /auth/signout — those two act on the cookie alone, need no body, and in
+    // production the cookie must be SameSite=None (different origins), so
+    // SameSite cannot stop it either.
+    //
+    // Pinned by tests/routes/auth-csrf.routes.test.ts.
     origin: (origin, callback) => {
       // Requests with no Origin header (server-to-server calls, webhooks,
       // curl/Postman) aren't subject to CORS and are always allowed through.
+      // This is not a CSRF hole: an attack of that kind requires a browser,
+      // and browsers always attach Origin to a cross-site POST. A client that
+      // sends none has no cookie jar to be exploited through.
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {

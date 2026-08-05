@@ -22,7 +22,13 @@ export const validateVerifyCode = [
     .isString()
     .notEmpty()
     .withMessage("Verification code is required"),
-  body("reason").isString().notEmpty().withMessage("Reason is required"),
+  // Defence in depth alongside the same check in verifyCode: this endpoint
+  // mints a session, so it must never accept a password_reset OTP. Previously
+  // any non-empty string got through.
+  body("reason")
+    .isString()
+    .isIn(["account_verification"])
+    .withMessage("Reason must be account_verification"),
   validate,
 ];
 

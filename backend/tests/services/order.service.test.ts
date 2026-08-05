@@ -724,45 +724,17 @@ describe("GetOrdersByShop", () => {
   });
 
   /**
-   * DEFECT — order.service.ts:125-139. `query` is spread into
-   * `countDocuments({ shopId, ...query })` but is never passed to
-   * `Orders.find({ shopId }, ...)`. A filtered request therefore returns every
-   * row while `totalCount` reports the filtered figure, so the caller sees
-   * rows it asked to exclude *and* a page count that disagrees with them.
-   *
-   * Latent today only because getOrdersByShopHandler builds `query` and leaves
-   * it `{}` — the kitchen filter that populated it
-   * (order.controller.ts:188-190) is commented out. Uncommenting it, or adding
-   * any status/date filter to the endpoint, silently ships other statuses to
-   * whoever asked for one. The two tests below pin down what happens now and
-   * what should happen; do not delete either without fixing the source.
+   * Regression: `query` used to be spread into `countDocuments` but never into
+   * `Orders.find`, so a filtered request returned every row while `totalCount`
+   * reported the filtered figure. Latent only because the one caller
+   * (getOrdersByShopHandler) leaves `query` empty with its kitchen filter
+   * commented out — any status or date filter added to that endpoint would
+   * have silently shipped other statuses to whoever asked for one.
    */
-  it("DEFECT: ignores `query` when selecting rows but honours it when counting", async () => {
+  it("returns only rows matching `query`, and counts the same set", async () => {
     const { GetOrdersByShop } = await orderService();
     await seedOrder(OrderStatus.Pending, SHOP_A);
     await seedOrder(OrderStatus.Pending, SHOP_A);
-    await seedOrder(OrderStatus.Pending, SHOP_A);
-    await seedOrder(OrderStatus.Confirmed, SHOP_A);
-    await seedOrder(OrderStatus.Confirmed, SHOP_A);
-
-    const { orders, totalCount } = await GetOrdersByShop({
-      shopId: SHOP_A.toString(),
-      query: { orderStatus: OrderStatus.Confirmed },
-      skip: 0,
-      limit: 10,
-    });
-
-    // Asserting the bug, deliberately. When it is fixed both of these flip to
-    // 2 and the skipped test below becomes the real one.
-    expect(orders).toHaveLength(5);
-    expect(
-      orders.filter((o) => o.orderStatus === OrderStatus.Pending),
-    ).toHaveLength(3);
-    expect(totalCount).toBe(2);
-  });
-
-  it.skip("should return only rows matching `query` (unskip once the defect above is fixed)", async () => {
-    const { GetOrdersByShop } = await orderService();
     await seedOrder(OrderStatus.Pending, SHOP_A);
     await seedOrder(OrderStatus.Confirmed, SHOP_A);
     await seedOrder(OrderStatus.Confirmed, SHOP_A);
@@ -775,6 +747,30 @@ describe("GetOrdersByShop", () => {
     });
 
     expect(orders).toHaveLength(2);
+    expect(
+      orders.filter((o) => o.orderStatus === OrderStatus.Pending),
+    ).toHaveLength(0);
+    // The rows and the count must agree, or the caller pages through a total
+    // that does not describe what it received.
     expect(totalCount).toBe(2);
+  });
+
+  it("cannot be made to read another shop's orders through `query`", async () => {
+    const { GetOrdersByShop } = await orderService();
+    await seedOrder(OrderStatus.Pending, SHOP_A);
+    await seedOrder(OrderStatus.Pending, SHOP_B);
+    await seedOrder(OrderStatus.Pending, SHOP_B);
+
+    // shopId is applied last, so a filter naming a different shop cannot widen
+    // the scope past the caller's own.
+    const { orders, totalCount } = await GetOrdersByShop({
+      shopId: SHOP_A.toString(),
+      query: { shopId: SHOP_B },
+      skip: 0,
+      limit: 10,
+    });
+
+    expect(orders).toHaveLength(1);
+    expect(totalCount).toBe(1);
   });
 });

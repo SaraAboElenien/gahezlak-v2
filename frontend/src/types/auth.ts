@@ -49,8 +49,3 @@ export interface VerifyCodeResponse {
   message: string;
   data: AccessTokenPayload & { user: VerifyCodeResponseUser };
 }
-
-export interface RefreshTokenResponse {
-  message: string;
-  data: AccessTokenPayload;
-}

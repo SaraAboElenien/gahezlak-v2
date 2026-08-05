@@ -103,6 +103,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Page weight is a product requirement here, not a cosmetic one: the core
+      # use case is a customer scanning a QR code on mobile data, at a table, in
+      # a restaurant. Nothing else measures bytes shipped — Vite copies public/
+      # through untouched and only hashes src/assets/ — so oversized images fail
+      # silently and slowly, showing up as a customer's data bill rather than a
+      # broken build. In 2026-08 this went unnoticed until 27 MB of unresized
+      # camera originals made the first `git push` time out.
+      #
+      # Runs before the install so it fails in seconds, and needs no node_modules.
+      - name: Check image weight
+        run: |
+          LIMIT_KB=500
+          # Pre-existing files above the budget, grandfathered so this gate could
+          # be introduced without a red build. They are debt, not an exemption:
+          # shrink each one and delete its line. Nothing may be ADDED here — the
+          # entire point is that a new oversized asset fails.
+          ALLOWLIST=" src/assets/pizza3.webp src/assets/pizza.png src/assets/pizza2.png "
+          status=0
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            case "$ALLOWLIST" in
+              *" $file "*) continue ;;
+            esac
+            kb=$(( $(wc -c < "$file") / 1024 ))
+            echo "::error file=frontend/$file::$file is ${kb}KB, over the ${LIMIT_KB}KB budget. Resize it, or justify it explicitly."
+            status=1
+          done <<EOF
+          $(find public src/assets -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.gif' \) -size +${LIMIT_KB}k)
+          EOF
+          if [ "$status" -eq 0 ]; then echo "All images within the ${LIMIT_KB}KB budget."; fi
+          exit $status
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}

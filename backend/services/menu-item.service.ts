@@ -72,6 +72,46 @@ export const toggleItemAvailability = async (
   return menuItem.toObject();
 };
 
+/**
+ * Fields a menu-item update is permitted to touch — mirrors
+ * `validateUpdateMenuItem`.
+ *
+ * The allowlist is the security control. `shopId` is an IMenuItem field that
+ * the validator does not name, and express-validator does not strip unlisted
+ * keys, so spreading `req.body` into the update let a caller move an item into
+ * a shop they do not own: the `{ _id, shopId }` filter matched using their own
+ * shop, then wrote someone else's id into the document. The item left their
+ * menu and appeared on the other shop's — priced by the original owner and
+ * orderable by the other shop's customers. Same class as the order IDOR fixed
+ * on 2026-07-30.
+ */
+const UPDATABLE_MENU_ITEM_FIELDS = [
+  "name",
+  "description",
+  "price",
+  "categoryId",
+  "imgUrl",
+  "discountPercentage",
+  "options",
+  "isAvailable",
+] as const satisfies readonly (keyof IMenuItem)[];
+
+function pickUpdatableMenuItemFields(
+  updateData: Partial<IMenuItem>,
+): Partial<IMenuItem> {
+  const updates: Partial<IMenuItem> = {};
+  for (const field of UPDATABLE_MENU_ITEM_FIELDS) {
+    const value = updateData[field];
+    if (value !== undefined) {
+      // TypeScript cannot correlate the key with its value type while `field`
+      // ranges over a union of keys, so it widens the target to `never`. The
+      // assignment is sound — the same `field` indexes both objects.
+      (updates as Record<string, unknown>)[field] = value;
+    }
+  }
+  return updates;
+}
+
 export const updateMenuItem = async (
   shopId: string,
   itemId: string,
@@ -79,8 +119,14 @@ export const updateMenuItem = async (
 ) => {
   const menuItem = await MenuItemModel.findOneAndUpdate(
     { _id: itemId, shopId },
-    updateData,
-    { new: true },
+    pickUpdatableMenuItemFields(updateData),
+    // runValidators keeps the schema's `discountPercentage` 0-100 bound live on
+    // updates. Without it the only thing enforcing that bound was the PATCH
+    // route's express-validator rule, so any non-HTTP writer (a seed script, an
+    // import, the AI menu extractor) could store a discount above 100 — which
+    // makes the line price CreateOrder computes negative, subtracting from the
+    // order total.
+    { new: true, runValidators: true },
   );
   if (!menuItem) throw new Errors.NotFoundError(errMsg.MENU_ITEM_NOT_FOUND);
 

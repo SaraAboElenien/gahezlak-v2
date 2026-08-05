@@ -318,20 +318,34 @@ describe("login", () => {
 
     const err = await captureError(login({ email: EMAIL, password: PASSWORD }));
 
-    // Note the ordering inside the service: this check runs *before* the
-    // password compare, so the "not verified" answer is given to anyone who
-    // guesses the address. See the enumeration test below.
+    // Only reachable with the correct password: the verified check runs after
+    // the password compare, so it cannot answer someone merely guessing at
+    // addresses. See the enumeration test below.
     expect(err).toBeInstanceOf(Errors.UnauthenticatedError);
   });
 
-  // DEFECT — not fixed here. services/auth.service.ts:216 vs :224.
-  // An unknown email fails inside findUserByEmail with NotFoundError /
-  // USER_NOT_FOUND / 404, while a known email with a wrong password fails with
-  // UnauthorizedError / INVALID_EMAIL_OR_PASSWORD / 403. The two are trivially
-  // distinguishable by status code and body, so /auth/login is an oracle for
-  // "is this address registered here" — the input to credential stuffing and
-  // targeted phishing. Remove `.skip` once both paths return the same error.
-  it.skip("does not reveal whether an email is registered", async () => {
+  it("does not reveal that an account exists to someone with the wrong password", async () => {
+    const { login } = await import("../../services/auth.service");
+    const { Errors } = await import("../../errors");
+    await register(); // registered, deliberately left unverified
+
+    const err = await captureError(
+      login({ email: EMAIL, password: OTHER_PASSWORD }),
+    );
+
+    // Not ACCOUNT_NOT_VERIFIED: replying "that account exists but isn't
+    // verified" to a failed password attempt would reinstate the oracle the
+    // test below closes.
+    expect(err).toBeInstanceOf(Errors.UnauthorizedError);
+  });
+
+  // Regression: an unknown email used to fail inside findUserByEmail with
+  // NotFoundError / USER_NOT_FOUND / 404 while a known email with a wrong
+  // password failed with UnauthorizedError / INVALID_EMAIL_OR_PASSWORD / 403.
+  // The two were trivially distinguishable by status code and body, making
+  // /auth/login an oracle for "is this address registered here" — the input to
+  // credential stuffing and targeted phishing.
+  it("does not reveal whether an email is registered", async () => {
     const { login } = await import("../../services/auth.service");
     await registerAndVerify();
 
@@ -434,16 +448,13 @@ describe("verifyCode", () => {
     expect((await storedUser()).isVerified).toBe(false);
   });
 
-  // DEFECT — not fixed here. services/auth.service.ts:139-185, reachable via
-  // POST /auth/verify-code, whose validator (validators/auth.validator.ts:25)
-  // accepts any non-empty string as `reason`.
-  // A password_reset OTP presented with reason "password_reset" satisfies every
-  // check in verifyCode, so it mints a full access token plus a 7-day refresh
-  // token and flips isVerified to true — without the holder ever setting a
-  // password. A reset code is therefore a login credential, and the reset flow
-  // doubles as an email-verification bypass. Least privilege says a reset code
-  // should only authorise resetPassword.
-  it.skip("does not let a password-reset code be exchanged for a session", async () => {
+  // Regression: a password_reset OTP presented with reason "password_reset"
+  // used to satisfy every check in verifyCode, so it minted a full access token
+  // plus a 7-day refresh token and flipped isVerified to true — without the
+  // holder ever setting a password. A reset code was therefore a login
+  // credential, and the reset flow doubled as an email-verification bypass.
+  // Least privilege: a reset code authorises resetPassword and nothing else.
+  it("does not let a password-reset code be exchanged for a session", async () => {
     const { forgotPassword, verifyCode } =
       await import("../../services/auth.service");
     await register();
@@ -486,19 +497,45 @@ describe("resendVerificationCode", () => {
     ).resolves.toMatchObject({ accessToken: expect.any(String) });
   });
 
-  it("refuses to resend to an account that is already verified", async () => {
+  it("silently does nothing for an account that is already verified", async () => {
     const { resendVerificationCode } =
       await import("../../services/auth.service");
-    const { Errors } = await import("../../errors");
     await registerAndVerify();
     sendEmailMock.mockClear(); // drop the signup email from the setup above
+    const before = await storedUser();
 
-    const err = await captureError(resendVerificationCode({ email: EMAIL }));
+    await resendVerificationCode({ email: EMAIL });
 
-    // Otherwise an unauthenticated caller could keep writing a fresh OTP onto a
-    // live account (and keep mailing it) indefinitely.
-    expect(err).toBeInstanceOf(Errors.BadRequestError);
+    // The protection is unchanged and is what these two assertions pin: an
+    // unauthenticated caller must not be able to write a fresh OTP onto a live
+    // account, nor keep mailing one out. Only the *answer* changed — see the
+    // enumeration test below for why it can no longer say "already verified".
     expect(sendEmailMock).not.toHaveBeenCalled();
+    expect((await storedUser()).verificationCode.code).toBe(
+      before.verificationCode.code,
+    );
+  });
+
+  it("does not reveal whether an email is registered, or its verification state", async () => {
+    const { resendVerificationCode } =
+      await import("../../services/auth.service");
+    await register(); // registered, not yet verified — the one real case
+    await registerAndVerify("already.verified@example.com");
+
+    const unverified = await resendVerificationCode({ email: EMAIL });
+    const verified = await resendVerificationCode({
+      email: "already.verified@example.com",
+    });
+    const unknown = await resendVerificationCode({
+      email: "ghost@example.com",
+    });
+
+    // Three different internal outcomes, one indistinguishable answer. These
+    // used to be 200, 400 USER_ALREADY_VERIFIED and 404 USER_NOT_FOUND, which
+    // handed an anonymous caller both a membership check and each account's
+    // verification state.
+    expect(verified).toEqual(unverified);
+    expect(unknown).toEqual(unverified);
   });
 });
 
@@ -519,14 +556,12 @@ describe("forgotPassword", () => {
     expect(html).toContain(user.verificationCode.code);
   });
 
-  // DEFECT — not fixed here. services/auth.service.ts:240 (findUserByEmail at
-  // :63-65). forgotPassword throws NotFoundError / 404 for an address that is
-  // not registered, but returns 200 "A password reset code has been sent" for
-  // one that is. The generic success message shows the intent was not to leak;
-  // the throw leaks anyway. Same enumeration oracle as /auth/login, on an
-  // endpoint that needs no credentials at all. The fix is to return the same
-  // generic response either way and simply not send mail for unknown addresses.
-  it.skip("does not reveal whether an email is registered", async () => {
+  // Regression: forgotPassword used to throw NotFoundError / 404 for an address
+  // that is not registered while returning 200 "A password reset code has been
+  // sent" for one that is. The generic success message showed the intent was
+  // never to leak; the throw leaked anyway. Same enumeration oracle as
+  // /auth/login, on an endpoint that needs no credentials at all.
+  it("does not reveal whether an email is registered", async () => {
     const { forgotPassword } = await import("../../services/auth.service");
     await registerAndVerify();
 
@@ -534,6 +569,18 @@ describe("forgotPassword", () => {
     const unknown = await forgotPassword({ email: "ghost@example.com" });
 
     expect(unknown).toEqual(known);
+  });
+
+  it("sends no mail for an address that is not registered", async () => {
+    const { forgotPassword } = await import("../../services/auth.service");
+    await registerAndVerify();
+    sendEmailMock.mockClear(); // drop the signup email from the setup above
+
+    await forgotPassword({ email: "ghost@example.com" });
+
+    // The generic response is a cover story, not a licence to mail strangers:
+    // an attacker could otherwise use it to spam an arbitrary inbox.
+    expect(sendEmailMock).not.toHaveBeenCalled();
   });
 });
 
@@ -596,6 +643,32 @@ describe("resetPassword", () => {
     await expect(
       compare(PASSWORD, (await storedUser()).password),
     ).resolves.toBe(true);
+  });
+
+  it("does not reveal whether an email is registered", async () => {
+    const { resetPassword } = await import("../../services/auth.service");
+    await registerAndVerify();
+
+    // A registered address with no reset pending, and an address that is not
+    // registered at all, are the same situation from the caller's side: there
+    // is no reset code for it. Answering 404 for the second would hand back the
+    // enumeration oracle that forgotPassword no longer gives out.
+    const noResetPending = await captureError(
+      resetPassword({ email: EMAIL, code: "000000", newPassword: PASSWORD }),
+    );
+    const notRegistered = await captureError(
+      resetPassword({
+        email: "ghost@example.com",
+        code: "000000",
+        newPassword: PASSWORD,
+      }),
+    );
+
+    expect(notRegistered.constructor.name).toBe(
+      noResetPending.constructor.name,
+    );
+    expect(notRegistered.statusCode).toBe(noResetPending.statusCode);
+    expect(notRegistered.message).toBe(noResetPending.message);
   });
 
   it("refuses a signup verification code as a reset code", async () => {
@@ -665,7 +738,10 @@ describe("resetPassword", () => {
       }),
     );
 
-    expect(err).toBeInstanceOf(Errors.NotFoundError);
+    // Still rejected, but as BadRequest/NO_VERIFICATION_CODE_FOUND rather than
+    // NotFound: the reason it is refused must not double as confirmation that
+    // the address is unregistered. See the enumeration test above.
+    expect(err).toBeInstanceOf(Errors.BadRequestError);
   });
 });
 

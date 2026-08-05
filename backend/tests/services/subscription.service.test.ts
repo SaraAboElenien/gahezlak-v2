@@ -1,0 +1,1004 @@
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  vi,
+} from "vitest";
+import mongoose from "mongoose";
+import type { Types } from "mongoose";
+import {
+  connectTestDB,
+  disconnectTestDB,
+  clearTestDB,
+} from "../db-test-helper";
+import { Subscriptions, SubscriptionStatus } from "../../models/Subscription";
+import { Plans } from "../../models/Plan";
+import type { IPlan } from "../../models/Plan";
+import { Shops } from "../../models/Shop";
+import { Users } from "../../models/User";
+import { errMsg } from "../../common/err-messages";
+import { assertShopHasActiveSubscription } from "../../middlewares/subscription-check.middleware";
+
+/**
+ * The subscription service is the other half of the money path: the order
+ * service decides what a *customer* pays a restaurant, this one decides what a
+ * *restaurant* pays us — and, through `SubscriptionStatus`, whether that
+ * restaurant may take orders at all. It had no tests.
+ *
+ * Two properties carry essentially all of the risk here.
+ *
+ * The first is `effectiveTrialDays`. The controller passes it straight to
+ * `createSubscriptionIntent`, which uses it to pick which Paymob integration
+ * runs the *first* transaction: > 0 selects the Verification integration
+ * (authorise, then auto-void, so a free trial really is free), 0 selects the
+ * ordinary card integration (a real charge). Getting that number wrong in one
+ * direction charged every free-trial signup the full plan price on day one —
+ * a real, shipped bug, fixed on 2026-08-05 — and in the other direction gives
+ * a paid month away. Nothing downstream re-derives it, so this number is the
+ * decision.
+ *
+ * The second is `status`. `assertShopHasActiveSubscription` admits only ACTIVE
+ * and TRIALING, so every status written here is an access-control decision as
+ * well as a billing one. In particular nothing in this file may ever write
+ * TRIALING or ACTIVE: those are the webhook's to write, once Paymob has
+ * confirmed a real transaction. Writing them earlier would hand a free trial
+ * to anyone who merely opened a checkout page.
+ *
+ * Deliberately NOT mocked: Mongo. Several of the behaviours that matter most
+ * (the shop-scoped upsert, what an `undefined` in `$set` actually does) are
+ * properties of the driver rather than of this file's control flow, and a
+ * mocked model cannot tell you about them. Only the Paymob boundary is stubbed.
+ */
+
+// The only external boundary the service touches. Left un-stubbed it would
+// attempt a real HTTPS call to accept.paymob.com against whatever credentials
+// happen to be in the environment — i.e. it could cancel a real subscription.
+const cancelPaymobSubscriptionMock = vi.hoisted(() => vi.fn());
+vi.mock("../../utils/paymob", () => ({
+  cancelPaymobSubscription: cancelPaymobSubscriptionMock,
+}));
+
+const SHOP_A = new mongoose.Types.ObjectId();
+const SHOP_B = new mongoose.Types.ObjectId();
+const USER_A = new mongoose.Types.ObjectId();
+const USER_B = new mongoose.Types.ObjectId();
+
+const DAY = 24 * 60 * 60 * 1000;
+
+// shops.name and users.email carry unique indexes, and the indexes survive
+// clearTestDB(); a counter keeps every seeded fixture distinct.
+let fixtureSeq = 0;
+const nextSeq = () => ++fixtureSeq;
+
+const subscriptionService = () => import("../../services/subscription.service");
+
+async function seedPlan(overrides: Partial<IPlan> = {}): Promise<IPlan> {
+  const plan = await Plans.create({
+    planGroup: "Starter",
+    title: `Starter monthly ${nextSeq()}`,
+    description: "Test plan",
+    frequency: "monthly",
+    currency: "EGP",
+    price: 299,
+    paymobPlanId: 11405,
+    features: ["QR menu"],
+    trialPeriodDays: 14,
+    isActive: true,
+    ...overrides,
+  });
+  // getPlanById() hands the controller a `.lean()` plan, so mirror a plain
+  // object rather than a hydrated document.
+  return plan.toObject();
+}
+
+async function seedSubscription(overrides: {
+  shop?: Types.ObjectId;
+  userId?: Types.ObjectId;
+  plan?: Types.ObjectId;
+  status?: SubscriptionStatus;
+  isTrialUsed?: boolean;
+  paymobSubscriptionId?: number;
+  paymobTransactionId?: number;
+  currentPeriodStart?: Date;
+  currentPeriodEnd?: Date;
+  cancelledAt?: Date;
+  createdAt?: Date;
+}) {
+  const { createdAt, ...fields } = overrides;
+  const subscription = await Subscriptions.create({
+    shop: SHOP_A,
+    userId: USER_A,
+    plan: new mongoose.Types.ObjectId(),
+    status: SubscriptionStatus.ACTIVE,
+    currentPeriodStart: new Date(),
+    currentPeriodEnd: new Date(Date.now() + 30 * DAY),
+    ...fields,
+  });
+
+  if (createdAt) {
+    // timestamps:false so the plugin doesn't stomp the value straight back.
+    await Subscriptions.findByIdAndUpdate(
+      subscription._id,
+      { createdAt },
+      { timestamps: false },
+    );
+  }
+
+  return subscription;
+}
+
+/**
+ * A subscription with real `users`, `shops` and `plans` documents behind it.
+ * getAllSubscriptions() `$lookup`s all three and then `$unwind`s them, so a
+ * subscription whose references do not resolve behaves very differently from
+ * one whose do — see the dangling-reference test.
+ */
+async function seedListableSubscription(
+  opts: {
+    status?: SubscriptionStatus;
+    email?: string;
+    shopName?: string;
+    planTitle?: string;
+    createdAt?: Date;
+  } = {},
+) {
+  const n = nextSeq();
+  const plan = await seedPlan({ title: opts.planTitle ?? `Plan ${n}` });
+  const user = await Users.create({
+    firstName: "Owner",
+    lastName: `Number${n}`,
+    email: opts.email ?? `owner${n}@example.com`,
+    password: "irrelevant-hash",
+    phoneNumber: "01000000000",
+    role: new mongoose.Types.ObjectId(),
+  });
+  const shop = await Shops.create({
+    name: opts.shopName ?? `Shop ${n}`,
+    type: "restaurant",
+    address: { country: "EG", city: "Cairo", street: "1 Main St" },
+    phoneNumber: "01000000000",
+    email: `shop${n}@example.com`,
+    ownerId: user._id,
+  });
+
+  const subscription = await seedSubscription({
+    shop: shop._id,
+    userId: user._id,
+    plan: plan._id,
+    status: opts.status ?? SubscriptionStatus.ACTIVE,
+    createdAt: opts.createdAt,
+  });
+
+  return { subscription, user, shop, plan };
+}
+
+beforeAll(async () => {
+  await connectTestDB();
+});
+
+afterAll(async () => {
+  await disconnectTestDB();
+});
+
+beforeEach(async () => {
+  await clearTestDB();
+  vi.clearAllMocks();
+  cancelPaymobSubscriptionMock.mockResolvedValue({ success: true });
+});
+
+describe("createOrUpdatePendingSubscription — trial eligibility", () => {
+  it("grants the plan's full trial to a shop that has never subscribed", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan({ trialPeriodDays: 14 });
+
+    const { subscription, effectiveTrialDays } =
+      await createOrUpdatePendingSubscription({
+        shopId: SHOP_A.toString(),
+        userId: USER_A.toString(),
+        plan,
+      });
+
+    // This number is the entire free-trial decision: the controller hands it to
+    // createSubscriptionIntent, which sends the first transaction through the
+    // authorise-and-void Verification integration when it is > 0 and through
+    // the ordinary card integration when it is 0. A wrong 0 here charges 299
+    // EGP to someone who was promised fourteen free days.
+    expect(effectiveTrialDays).toBe(14);
+    expect(subscription.isTrialUsed).toBe(true);
+
+    const span =
+      subscription.currentPeriodEnd.getTime() -
+      subscription.currentPeriodStart.getTime();
+    expect(Math.round(span / DAY)).toBe(14);
+  });
+
+  it("gives no trial on a plan that does not offer one", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan({ trialPeriodDays: 0 });
+
+    const { subscription, effectiveTrialDays } =
+      await createOrUpdatePendingSubscription({
+        shopId: SHOP_A.toString(),
+        userId: USER_A.toString(),
+        plan,
+      });
+
+    expect(effectiveTrialDays).toBe(0);
+    // Not merely cosmetic: `isTrialUsed` is the only record that a shop has
+    // ever had a trial, and setting it here would burn a trial the shop never
+    // received.
+    expect(subscription.isTrialUsed).toBe(false);
+    // A zero-length period, which is correct for now — the real billing period
+    // is computed by the webhook once Paymob confirms the charge. Access is
+    // gated on `status` alone, so nothing reads these dates in the meantime.
+    expect(subscription.currentPeriodEnd.getTime()).toBe(
+      subscription.currentPeriodStart.getTime(),
+    );
+  });
+
+  it("leaves the subscription pending, so the shop gets nothing before Paymob confirms", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan({ trialPeriodDays: 14 });
+
+    const { subscription } = await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan,
+    });
+
+    // TRIALING and ACTIVE belong to the webhook, which only writes them after a
+    // real transaction. If this wrote TRIALING directly, opening the checkout
+    // page and abandoning it would be worth fourteen free days — and the
+    // service would then refuse to create the pending row on the next honest
+    // attempt, because a TRIALING row already exists.
+    expect(subscription.status).toBe(SubscriptionStatus.PENDING);
+    await expect(assertShopHasActiveSubscription(SHOP_A)).rejects.toThrow();
+  });
+
+  it("does not hand a second trial to a shop whose trial record survives", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan({ trialPeriodDays: 14 });
+    await seedSubscription({
+      status: SubscriptionStatus.EXPIRED,
+      isTrialUsed: true,
+    });
+
+    const { effectiveTrialDays } = await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan,
+    });
+
+    // One trial per shop, not one per subscription attempt.
+    expect(effectiveTrialDays).toBe(0);
+  });
+
+  it("scopes trial eligibility to the shop, not globally", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan({ trialPeriodDays: 14 });
+    await seedSubscription({
+      shop: SHOP_B,
+      userId: USER_B,
+      status: SubscriptionStatus.EXPIRED,
+      isTrialUsed: true,
+    });
+
+    const { effectiveTrialDays } = await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan,
+    });
+
+    // Another restaurant having used its trial must not deny this one its own.
+    expect(effectiveTrialDays).toBe(14);
+  });
+
+  /**
+   * DEFECT MARKER — do not delete; un-skip when the source is fixed.
+   *
+   * "Has this shop had a trial?" is answered by `findOne({ shop, isTrialUsed:
+   * true })`, and the answer is then written back over the *same* row as
+   * `isTrialUsed: isEligibleForTrial`. So the second subscription — correctly
+   * refused a trial — also erases the evidence that the first one had one, and
+   * the third subscription is judged trial-eligible again.
+   *
+   * A restaurant therefore gets a free 14 days on every *odd* subscription,
+   * indefinitely, by letting the paid one lapse and re-subscribing. Both halves
+   * of it look right in isolation, which is why it survives review: the gate
+   * itself is correct, it is the write that destroys the gate's own input.
+   *
+   * The fix is not to widen the query — the row is upserted per shop, so there
+   * is only ever one — but to stop clearing the flag: `isTrialUsed` should be
+   * latched (`isTrialUsed: isEligibleForTrial || previousSubWithTrial != null`,
+   * or simply omitted from the `$set` when the shop has already used one).
+   */
+  it("never hands out a second trial, however often the shop re-subscribes", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan({ trialPeriodDays: 14 });
+    const subscribe = () =>
+      createOrUpdatePendingSubscription({
+        shopId: SHOP_A.toString(),
+        userId: USER_A.toString(),
+        plan,
+      });
+    const lapse = () =>
+      Subscriptions.updateOne(
+        { shop: SHOP_A },
+        { $set: { status: SubscriptionStatus.EXPIRED } },
+      );
+
+    const first = await subscribe();
+    await lapse();
+    const second = await subscribe();
+    await lapse();
+    const third = await subscribe();
+
+    expect(first.effectiveTrialDays).toBe(14);
+    expect(second.effectiveTrialDays).toBe(0);
+    expect(third.effectiveTrialDays).toBe(0);
+  });
+});
+
+describe("createOrUpdatePendingSubscription — one live subscription per shop", () => {
+  it.each([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING])(
+    "refuses to start a new subscription while one is %s",
+    async (status) => {
+      const { createOrUpdatePendingSubscription } = await subscriptionService();
+      const plan = await seedPlan();
+      const existing = await seedSubscription({
+        status,
+        paymobSubscriptionId: 900001,
+      });
+
+      await expect(
+        createOrUpdatePendingSubscription({
+          shopId: SHOP_A.toString(),
+          userId: USER_A.toString(),
+          plan,
+        }),
+      ).rejects.toThrow(errMsg.USER_ALREADY_SUBSCRIBED.en);
+
+      // The guard is what stops the upsert below it from overwriting a live,
+      // Paymob-backed subscription with a pending one — which would revoke the
+      // shop's access while Paymob carried on billing the card.
+      const stored = await Subscriptions.findById(existing._id).lean();
+      expect(stored?.status).toBe(status);
+      expect(stored?.paymobSubscriptionId).toBe(900001);
+      await expect(Subscriptions.countDocuments()).resolves.toBe(1);
+    },
+  );
+
+  it("refuses while a cancelled subscription is still inside its paid period", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan();
+    await seedSubscription({
+      status: SubscriptionStatus.CANCELLED,
+      currentPeriodEnd: new Date(Date.now() + 10 * DAY),
+      cancelledAt: new Date(),
+    });
+
+    // A cancellation takes effect at period end, so the shop has already paid
+    // for these ten days; letting it subscribe again now would charge it twice
+    // for the same window.
+    await expect(
+      createOrUpdatePendingSubscription({
+        shopId: SHOP_A.toString(),
+        userId: USER_A.toString(),
+        plan,
+      }),
+    ).rejects.toThrow(errMsg.USER_ALREADY_SUBSCRIBED.en);
+  });
+
+  it("allows re-subscribing once the cancelled period has run out", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan();
+    await seedSubscription({
+      status: SubscriptionStatus.CANCELLED,
+      currentPeriodEnd: new Date(Date.now() - DAY),
+      cancelledAt: new Date(Date.now() - 30 * DAY),
+    });
+
+    const { subscription } = await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan,
+    });
+
+    // The mirror image of the test above: past period end the cancellation is
+    // spent, and a shop that cannot come back is a customer we cannot re-sell.
+    expect(subscription.status).toBe(SubscriptionStatus.PENDING);
+  });
+
+  it("allows re-subscribing after the previous subscription expired", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan();
+    await seedSubscription({ status: SubscriptionStatus.EXPIRED });
+
+    const { subscription } = await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan,
+    });
+
+    expect(subscription.status).toBe(SubscriptionStatus.PENDING);
+  });
+
+  it("reuses the same row when a shop retries a payment that never completed", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan();
+    const first = await seedSubscription({
+      status: SubscriptionStatus.PENDING,
+    });
+
+    const { subscription } = await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan,
+    });
+
+    // The declined-card retry. `shop` is uniquely indexed, so inserting a
+    // second row rather than updating the first would not merely duplicate
+    // data — it would fail with a duplicate-key error and leave the shop
+    // permanently unable to pay us.
+    expect(subscription._id.toString()).toBe(first._id.toString());
+    await expect(Subscriptions.countDocuments()).resolves.toBe(1);
+  });
+
+  it("is not blocked by another shop's live subscription", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan();
+    await seedSubscription({
+      shop: SHOP_B,
+      userId: USER_B,
+      status: SubscriptionStatus.ACTIVE,
+    });
+
+    const { subscription } = await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan,
+    });
+
+    expect(subscription.shop.toString()).toBe(SHOP_A.toString());
+    await expect(Subscriptions.countDocuments()).resolves.toBe(2);
+  });
+});
+
+describe("createOrUpdatePendingSubscription — re-subscribe hygiene", () => {
+  it("re-points the row at the newly chosen plan and the acting user", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const oldPlan = await seedPlan({ title: "Starter", price: 299 });
+    const newPlan = await seedPlan({ title: "Pro", price: 799 });
+    await seedSubscription({
+      status: SubscriptionStatus.EXPIRED,
+      plan: oldPlan._id,
+      userId: USER_B,
+    });
+
+    const { subscription } = await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan: newPlan,
+    });
+
+    // An upgrade that kept pointing at the old plan would bill the shop 299 for
+    // a 799 subscription — and `handleSubscriptionRenewed` reads the plan's
+    // frequency off this reference to compute every future billing period.
+    expect(subscription.plan.toString()).toBe(newPlan._id.toString());
+    // Ownership follows the person who actually paid; the previous owner may no
+    // longer even be on the shop.
+    expect(subscription.userId.toString()).toBe(USER_A.toString());
+  });
+
+  /**
+   * DEFECT MARKER — do not delete; un-skip when the source is fixed.
+   *
+   * The `$set` clears the previous Paymob linkage with `paymobSubscriptionId:
+   * undefined`, `paymobTransactionId: undefined` and `cancelledAt: undefined`.
+   * Mongoose ≥ 6 strips `undefined` keys out of an update rather than unsetting
+   * the field (the `omitUndefined` option was removed), so all three survive
+   * untouched. Verified against the real driver, not inferred: the write simply
+   * does not happen.
+   *
+   * Consequences, in descending order of cost:
+   *
+   *  1. `handleSubscriptionCreated` bails out early with `if
+   *     (subscription.paymobSubscriptionId) return;` — so the *new* Paymob
+   *     subscription id is never stored. Every later cancel / suspend / resume
+   *     / renewal webhook looks the subscription up by `paymobSubscriptionId`,
+   *     and that id still belongs to the shop's previous subscription. The new
+   *     one is then unreachable by webhook for its entire life: it never
+   *     renews its period, never suspends on non-payment, never records a
+   *     cancellation.
+   *  2. `cancelSubscription` posts the *old* id to Paymob's cancel endpoint,
+   *     so "cancel my subscription" leaves the live recurring mandate running.
+   *  3. A stale `cancelledAt` sits on a subscription that is not cancelled.
+   *
+   * The fix is `$unset` (or `null`) for the three fields rather than
+   * `undefined`.
+   */
+  it("clears the previous Paymob linkage when a shop re-subscribes", async () => {
+    const { createOrUpdatePendingSubscription } = await subscriptionService();
+    const plan = await seedPlan();
+    await seedSubscription({
+      status: SubscriptionStatus.EXPIRED,
+      paymobSubscriptionId: 900002,
+      paymobTransactionId: 800002,
+      cancelledAt: new Date(Date.now() - 5 * DAY),
+    });
+
+    await createOrUpdatePendingSubscription({
+      shopId: SHOP_A.toString(),
+      userId: USER_A.toString(),
+      plan,
+    });
+
+    const stored = await Subscriptions.findOne({ shop: SHOP_A }).lean();
+    expect(stored?.paymobSubscriptionId).toBeUndefined();
+    expect(stored?.paymobTransactionId).toBeUndefined();
+    expect(stored?.cancelledAt).toBeUndefined();
+  });
+});
+
+describe("cancelSubscription", () => {
+  it("cancels at Paymob first, using the stored remote id, then locally", async () => {
+    const { cancelSubscription } = await subscriptionService();
+    const before = Date.now();
+    const existing = await seedSubscription({
+      status: SubscriptionStatus.ACTIVE,
+      paymobSubscriptionId: 900003,
+    });
+
+    const result = await cancelSubscription(USER_A.toString());
+
+    // Cancelling only locally is the expensive failure: the shop stops being
+    // billed in our database while Paymob's recurring mandate keeps charging
+    // the owner's card every month with nothing on our side to show for it.
+    expect(cancelPaymobSubscriptionMock).toHaveBeenCalledExactlyOnceWith(
+      900003,
+    );
+    expect(result.status).toBe(SubscriptionStatus.CANCELLED);
+
+    const stored = await Subscriptions.findById(existing._id).lean();
+    expect(stored?.status).toBe(SubscriptionStatus.CANCELLED);
+    expect(stored?.cancelledAt?.getTime()).toBeGreaterThanOrEqual(before);
+  });
+
+  it("does not call Paymob for a subscription that was never billed", async () => {
+    const { cancelSubscription } = await subscriptionService();
+    await seedSubscription({ status: SubscriptionStatus.PENDING });
+
+    const result = await cancelSubscription(USER_A.toString());
+
+    // A pending or trial subscription that never reached Paymob has no remote
+    // id; posting `undefined` to /subscriptions/undefined/cancel would fail the
+    // whole request and leave the shop unable to abandon a signup it never
+    // completed.
+    expect(cancelPaymobSubscriptionMock).not.toHaveBeenCalled();
+    expect(result.status).toBe(SubscriptionStatus.CANCELLED);
+  });
+
+  it("leaves the local subscription untouched when Paymob refuses to cancel", async () => {
+    const { cancelSubscription } = await subscriptionService();
+    const existing = await seedSubscription({
+      status: SubscriptionStatus.ACTIVE,
+      paymobSubscriptionId: 900004,
+    });
+    cancelPaymobSubscriptionMock.mockRejectedValue(new Error("paymob down"));
+
+    await expect(cancelSubscription(USER_A.toString())).rejects.toThrow();
+
+    // Ordering is the whole guarantee here: the remote cancellation is awaited
+    // before anything local is written, so a Paymob outage surfaces as a failed
+    // request the owner can retry rather than as a subscription that looks
+    // cancelled to us and live to Paymob.
+    const stored = await Subscriptions.findById(existing._id).lean();
+    expect(stored?.status).toBe(SubscriptionStatus.ACTIVE);
+    expect(stored?.cancelledAt).toBeUndefined();
+  });
+
+  it.each([
+    SubscriptionStatus.ACTIVE,
+    SubscriptionStatus.TRIALING,
+    SubscriptionStatus.PENDING,
+    SubscriptionStatus.EXPIRED,
+  ])("can cancel a subscription that is %s", async (status) => {
+    const { cancelSubscription } = await subscriptionService();
+    await seedSubscription({ status });
+
+    await expect(cancelSubscription(USER_A.toString())).resolves.toMatchObject({
+      status: SubscriptionStatus.CANCELLED,
+    });
+  });
+
+  it("refuses when the caller has nothing left to cancel", async () => {
+    const { cancelSubscription } = await subscriptionService();
+    const { Errors } = await import("../../errors");
+    await seedSubscription({
+      status: SubscriptionStatus.CANCELLED,
+      cancelledAt: new Date(Date.now() - DAY),
+    });
+
+    await expect(cancelSubscription(USER_A.toString())).rejects.toBeInstanceOf(
+      Errors.NotFoundError,
+    );
+
+    // Re-cancelling must not move `cancelledAt` forward: it is the date the
+    // grace period is reasoned about from.
+    expect(cancelPaymobSubscriptionMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the caller has no subscription at all", async () => {
+    const { cancelSubscription } = await subscriptionService();
+
+    await expect(cancelSubscription(USER_A.toString())).rejects.toThrow(
+      errMsg.NO_ACTIVE_SUBSCRIPTION.en,
+    );
+  });
+
+  it("will not let one user cancel another user's subscription", async () => {
+    const { cancelSubscription } = await subscriptionService();
+    const other = await seedSubscription({
+      shop: SHOP_B,
+      userId: USER_B,
+      status: SubscriptionStatus.ACTIVE,
+      paymobSubscriptionId: 900005,
+    });
+
+    // The handler passes the authenticated user's own id, so this is the check
+    // standing between an authenticated shop owner and cancelling a competitor's
+    // subscription — both locally and, via the mocked call, at Paymob.
+    await expect(cancelSubscription(USER_A.toString())).rejects.toThrow();
+
+    expect(cancelPaymobSubscriptionMock).not.toHaveBeenCalled();
+    const stored = await Subscriptions.findById(other._id).lean();
+    expect(stored?.status).toBe(SubscriptionStatus.ACTIVE);
+  });
+
+  /**
+   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed. Do not
+   * "fix" this by changing the assertions.
+   *
+   * Cancelling keeps `currentPeriodEnd` deliberately: the webhook's cancel
+   * handler says in as many words that the shop "can use service until period
+   * ends". It cannot. `assertShopHasActiveSubscription` admits only ACTIVE and
+   * TRIALING, so access dies the instant CANCELLED is written — while
+   * `createOrUpdatePendingSubscription` still treats that same row as a live
+   * subscription until `currentPeriodEnd` passes.
+   *
+   * A shop that cancels one day into a paid month therefore spends the rest of
+   * the month unable to take a single order *and* unable to re-subscribe, with
+   * the money already taken. Two reasonable behaviours (cancel-at-period-end
+   * billing, status-only gating) compose into one that nobody chose.
+   */
+  it("keeps the paid period but revokes access immediately", async () => {
+    const { cancelSubscription } = await subscriptionService();
+    const periodEnd = new Date(Date.now() + 25 * DAY);
+    await seedSubscription({
+      status: SubscriptionStatus.ACTIVE,
+      currentPeriodEnd: periodEnd,
+      paymobSubscriptionId: 900006,
+    });
+
+    await cancelSubscription(USER_A.toString());
+
+    const stored = await Subscriptions.findOne({ shop: SHOP_A }).lean();
+    expect(stored?.currentPeriodEnd.getTime()).toBe(periodEnd.getTime());
+    // Paid up for 25 more days, and locked out for all of them.
+    await expect(assertShopHasActiveSubscription(SHOP_A)).rejects.toThrow();
+  });
+});
+
+describe("getUserActiveSubscription", () => {
+  it.each([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING])(
+    "returns a subscription that is %s",
+    async (status) => {
+      const { getUserActiveSubscription } = await subscriptionService();
+      const { user } = await seedListableSubscription({ status });
+
+      const found = await getUserActiveSubscription(user._id.toString());
+
+      expect(found?.status).toBe(status);
+    },
+  );
+
+  it.each([SubscriptionStatus.CANCELLED, SubscriptionStatus.EXPIRED])(
+    "returns nothing for a subscription that is %s",
+    async (status) => {
+      const { getUserActiveSubscription } = await subscriptionService();
+      const { user } = await seedListableSubscription({ status });
+
+      await expect(
+        getUserActiveSubscription(user._id.toString()),
+      ).resolves.toBeNull();
+    },
+  );
+
+  /**
+   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed.
+   *
+   * PENDING means "we have written a row and sent the owner to Paymob's
+   * checkout page", nothing more; `assertShopHasActiveSubscription` rejects it,
+   * correctly. This query admits it anyway, so a shop that opened the checkout
+   * page and closed it is told by its own dashboard that it has a subscription,
+   * while every gated action goes on failing. The two answers should come from
+   * the same predicate.
+   */
+  it("also reports an unpaid pending subscription as the user's active one", async () => {
+    const { getUserActiveSubscription } = await subscriptionService();
+    const { user } = await seedListableSubscription({
+      status: SubscriptionStatus.PENDING,
+    });
+
+    const found = await getUserActiveSubscription(user._id.toString());
+
+    expect(found?.status).toBe(SubscriptionStatus.PENDING);
+    await expect(
+      assertShopHasActiveSubscription(
+        (found!.shop as { _id: Types.ObjectId })._id,
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("populates the plan and shop the dashboard renders, without Paymob's internals", async () => {
+    const { getUserActiveSubscription } = await subscriptionService();
+    const { user, shop, plan } = await seedListableSubscription({
+      planTitle: "Pro yearly",
+    });
+
+    const found = await getUserActiveSubscription(user._id.toString());
+    const populatedPlan = found?.plan as IPlan;
+    const populatedShop = found?.shop as { name: string };
+
+    expect(populatedPlan.title).toBe("Pro yearly");
+    expect(populatedShop.name).toBe(shop.name);
+    // The projection is deliberately a whitelist. `paymobPlanId` is our own
+    // billing-side identifier for the plan on Paymob and has no business being
+    // serialised to a browser — it is exactly the sort of field that leaks by
+    // default the day someone replaces the select string with a bare populate.
+    expect(populatedPlan.paymobPlanId).toBeUndefined();
+    expect(plan.paymobPlanId).toBe(11405);
+  });
+
+  it("is scoped to the requesting user", async () => {
+    const { getUserActiveSubscription } = await subscriptionService();
+    await seedListableSubscription({ status: SubscriptionStatus.ACTIVE });
+
+    await expect(
+      getUserActiveSubscription(new mongoose.Types.ObjectId().toString()),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("getAllSubscriptions", () => {
+  it("paginates while reporting the unpaginated total", async () => {
+    const { getAllSubscriptions } = await subscriptionService();
+    const base = Date.UTC(2026, 0, 1);
+    for (let i = 0; i < 5; i++) {
+      await seedListableSubscription({
+        createdAt: new Date(base + i * 60_000),
+      });
+    }
+
+    const page1 = await getAllSubscriptions({ page: 1, limit: 2 });
+    const page3 = await getAllSubscriptions({ page: 3, limit: 2 });
+
+    expect(page1.subscriptions).toHaveLength(2);
+    expect(page3.subscriptions).toHaveLength(1);
+    // totalCount drives the admin UI's page count, so it must ignore the page
+    // window — but still respect the filters, which the count pipeline gets by
+    // reusing every stage before the `$sort`.
+    expect(page1.totalCount).toBe(5);
+    expect(page3.totalCount).toBe(5);
+  });
+
+  it("sorts newest first", async () => {
+    const { getAllSubscriptions } = await subscriptionService();
+    const base = Date.UTC(2026, 0, 1);
+    const oldest = await seedListableSubscription({
+      createdAt: new Date(base),
+    });
+    const newest = await seedListableSubscription({
+      createdAt: new Date(base + 60_000),
+    });
+
+    const { subscriptions } = await getAllSubscriptions({});
+
+    expect(subscriptions.map((s) => s._id.toString())).toEqual([
+      newest.subscription._id.toString(),
+      oldest.subscription._id.toString(),
+    ]);
+  });
+
+  it("filters by status, and counts the same set it returns", async () => {
+    const { getAllSubscriptions } = await subscriptionService();
+    await seedListableSubscription({ status: SubscriptionStatus.ACTIVE });
+    await seedListableSubscription({ status: SubscriptionStatus.ACTIVE });
+    await seedListableSubscription({ status: SubscriptionStatus.EXPIRED });
+
+    const { subscriptions, totalCount } = await getAllSubscriptions({
+      status: SubscriptionStatus.EXPIRED,
+    });
+
+    expect(subscriptions).toHaveLength(1);
+    // Rows and count disagreeing is the quiet failure: the admin pages through
+    // a total that does not describe what they were shown.
+    expect(totalCount).toBe(1);
+  });
+
+  it.each([
+    ["user email", (seeded: { user: { email: string } }) => seeded.user.email],
+    ["shop name", (seeded: { shop: { name: string } }) => seeded.shop.name],
+    ["plan title", (seeded: { plan: { title: string } }) => seeded.plan.title],
+  ])("searches by %s", async (_label, pick) => {
+    const { getAllSubscriptions } = await subscriptionService();
+    const wanted = await seedListableSubscription({
+      email: "findme@example.com",
+      shopName: "Needle Bistro",
+      planTitle: "Needle Pro",
+    });
+    await seedListableSubscription({
+      email: "other@example.com",
+      shopName: "Haystack Grill",
+      planTitle: "Haystack Starter",
+    });
+
+    const { subscriptions, totalCount } = await getAllSubscriptions({
+      search: pick(wanted).toUpperCase(),
+    });
+
+    // Upper-cased on the way in: the `$options: "i"` is what makes the admin
+    // search usable at all, since none of the three fields is normalised.
+    expect(subscriptions).toHaveLength(1);
+    expect(totalCount).toBe(1);
+    expect(subscriptions[0]._id.toString()).toBe(
+      wanted.subscription._id.toString(),
+    );
+  });
+
+  /**
+   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed.
+   *
+   * `search` is interpolated straight into `$regex`, so the admin's search box
+   * takes a regular expression rather than a literal string. "." matching every
+   * row is the harmless demonstration; the real costs are that searching for a
+   * literal email finds near-misses too, and that a pathological pattern is a
+   * ReDoS run server-side against three fields of every subscription. Admin-only
+   * and therefore low severity, but the fix is a one-line escape.
+   */
+  it("treats the search term as a regular expression, not a literal", async () => {
+    const { getAllSubscriptions } = await subscriptionService();
+    await seedListableSubscription({ email: "a@example.com" });
+    await seedListableSubscription({ email: "b@example.com" });
+
+    const { subscriptions, totalCount } = await getAllSubscriptions({
+      search: ".",
+    });
+
+    expect(subscriptions).toHaveLength(2);
+    expect(totalCount).toBe(2);
+  });
+
+  /**
+   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed.
+   *
+   * The pipeline `$lookup`s users, shops and plans and then `$unwind`s all
+   * three, which is an inner join: a subscription whose user, shop or plan no
+   * longer resolves vanishes from the admin list entirely, and from the total
+   * alongside it. The list is at least self-consistent — the count pipeline
+   * reuses the same stages — but it is a revenue list that silently
+   * under-reports rather than showing a row with a missing name.
+   * `preserveNullAndEmptyArrays: true` on the three `$unwind`s is the fix.
+   */
+  it("silently drops a subscription whose shop no longer exists", async () => {
+    const { getAllSubscriptions } = await subscriptionService();
+    await seedListableSubscription();
+    const orphan = await seedListableSubscription();
+    await Shops.deleteOne({ _id: orphan.shop._id });
+
+    const { subscriptions, totalCount } = await getAllSubscriptions({});
+
+    expect(subscriptions).toHaveLength(1);
+    expect(totalCount).toBe(1);
+    // Still very much in the database, and still billable.
+    await expect(Subscriptions.countDocuments()).resolves.toBe(2);
+  });
+
+  /**
+   * DEFECT MARKER — do not delete; un-skip when the source is fixed.
+   *
+   * `userId` and `planId` arrive from the query string as strings and are put
+   * into a `$match` unchanged. `Model.aggregate()` performs no schema casting —
+   * unlike `find()`, which casts the same string to an ObjectId happily — so
+   * the stage compares a string against an ObjectId and matches nothing, ever.
+   * Verified against the real driver.
+   *
+   * Both admin filters therefore return an empty list with `totalCount: 0` for
+   * every input, including correct ones. It reads as "this customer has no
+   * subscriptions" rather than as an error, which is the worst possible
+   * failure mode for a support tool: the answer looks authoritative. `status`
+   * is unaffected, being a string in the schema too, which is presumably why
+   * the endpoint appears to work.
+   *
+   * The fix is to cast in the service — `new mongoose.Types.ObjectId(userId)`
+   * — as anything building a `$match` by hand must.
+   */
+  it("filters by userId and by planId", async () => {
+    const { getAllSubscriptions } = await subscriptionService();
+    const wanted = await seedListableSubscription();
+    await seedListableSubscription();
+
+    const byUser = await getAllSubscriptions({
+      userId: wanted.user._id.toString(),
+    });
+    const byPlan = await getAllSubscriptions({
+      planId: wanted.plan._id.toString(),
+    });
+
+    expect(byUser.subscriptions).toHaveLength(1);
+    expect(byUser.totalCount).toBe(1);
+    expect(byPlan.subscriptions).toHaveLength(1);
+    expect(byPlan.totalCount).toBe(1);
+  });
+
+  it("returns an empty page and a zero total when nothing matches", async () => {
+    const { getAllSubscriptions } = await subscriptionService();
+    await seedListableSubscription({ status: SubscriptionStatus.ACTIVE });
+
+    const { subscriptions, totalCount } = await getAllSubscriptions({
+      search: "no-such-customer",
+    });
+
+    // `countResult[0]?.totalCount || 0` — an empty `$count` result yields no
+    // documents at all, so the fallback is what stops the admin UI dividing by
+    // undefined.
+    expect(subscriptions).toHaveLength(0);
+    expect(totalCount).toBe(0);
+  });
+});
+
+describe("getSubscriptionById", () => {
+  it("populates the owner, shop and plan an admin needs to act on a dispute", async () => {
+    const { getSubscriptionById } = await subscriptionService();
+    const { subscription, user, shop, plan } = await seedListableSubscription({
+      planTitle: "Pro monthly",
+    });
+
+    const found = await getSubscriptionById(subscription._id.toString());
+    const owner = found?.userId as unknown as { email: string };
+
+    expect(owner.email).toBe(user.email);
+    expect((found?.shop as { name: string }).name).toBe(shop.name);
+    expect((found?.plan as IPlan).title).toBe(plan.title);
+    // Same whitelist as the dashboard query: an admin view is still a browser.
+    expect((found?.plan as IPlan).paymobPlanId).toBeUndefined();
+  });
+
+  it("returns null for an id that does not exist", async () => {
+    const { getSubscriptionById } = await subscriptionService();
+
+    // The controller turns null into a 404; anything else it gets, it doesn't
+    // handle.
+    await expect(
+      getSubscriptionById(new mongoose.Types.ObjectId().toString()),
+    ).resolves.toBeNull();
+  });
+
+  /**
+   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed.
+   *
+   * A malformed id reaches `findById` uncast and Mongoose throws a CastError,
+   * which is not a `CustomError` — so the handler's "null means 404" path is
+   * never taken and the error middleware falls through to a 500. A mistyped URL
+   * in the admin panel reports a server fault rather than "not found"; it also
+   * means the route has no id validation at all.
+   */
+  it("throws rather than returning null for a malformed id", async () => {
+    const { getSubscriptionById } = await subscriptionService();
+
+    await expect(getSubscriptionById("not-an-object-id")).rejects.toThrow();
+  });
+});

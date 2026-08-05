@@ -14,7 +14,6 @@ export interface User {
   newEmail?: string | null;
   role: string;
   shop: string;
-  refreshToken: string;
   verificationCode: VerificationCode;
   createdAt: string;
   updatedAt: string;

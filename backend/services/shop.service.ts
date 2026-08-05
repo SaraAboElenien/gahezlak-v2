@@ -91,8 +91,48 @@ async function getShop({
   return shop;
 }
 
+/**
+ * Fields a shop update is permitted to touch — mirrors `updateShopValidator`.
+ *
+ * This allowlist is the security control, not a tidiness measure. The update
+ * data is built from `req.body` verbatim, and express-validator checks the
+ * fields it names without stripping the ones it doesn't. `ownerId` and
+ * `members` are both IShop fields, so spreading the body straight into the
+ * update let a caller rewrite them — and `PUT /shops/id/:shopId` admits
+ * SHOP_MANAGER as well as the owner, so a manager could reassign the shop to
+ * themselves. Because the owner is never in `members` (createShop doesn't add
+ * them), moving `ownerId` also stops `getUserShop` resolving for the real
+ * owner, whose subscription-gated dashboard then closes entirely.
+ *
+ * Anything added here must be a field an ordinary shop editor may set.
+ */
+const UPDATABLE_SHOP_FIELDS = [
+  "name",
+  "address",
+  "phoneNumber",
+  "email",
+] as const satisfies readonly (keyof IShop)[];
+
+function pickUpdatableShopFields(shopData: Partial<IShop>): Partial<IShop> {
+  const updates: Partial<IShop> = {};
+  for (const field of UPDATABLE_SHOP_FIELDS) {
+    const value = shopData[field];
+    if (value !== undefined) {
+      // TypeScript cannot correlate the key with its value type while `field`
+      // ranges over a union of keys, so it widens the target to `never`. The
+      // assignment is sound — the same `field` indexes both objects.
+      (updates as Record<string, unknown>)[field] = value;
+    }
+  }
+  return updates;
+}
+
 async function updateShop(shopId: string, shopData: Partial<IShop>) {
-  const shop = await Shops.findByIdAndUpdate(shopId, shopData, { new: true });
+  const shop = await Shops.findByIdAndUpdate(
+    shopId,
+    pickUpdatableShopFields(shopData),
+    { new: true, runValidators: true },
+  );
   if (!shop) {
     throw new Errors.NotFoundError(errMsg.SHOP_NOT_FOUND);
   }

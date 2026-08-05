@@ -7,7 +7,22 @@ import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
 import { IPlan } from "../models/Plan";
 import { cancelPaymobSubscription } from "../utils/paymob";
-import { FilterQuery, PipelineStage } from "mongoose";
+import mongoose, { FilterQuery, PipelineStage } from "mongoose";
+
+/**
+ * Casts a caller-supplied id for use in an aggregation `$match`, rejecting a
+ * malformed one with a 400 rather than letting the BSON constructor throw a
+ * generic 500 out of the driver.
+ */
+function toObjectId(value: string, field: string): mongoose.Types.ObjectId {
+  if (!mongoose.isValidObjectId(value)) {
+    throw new Errors.BadRequestError({
+      en: `Invalid ${field}`,
+      ar: `${field} غير صالح`,
+    });
+  }
+  return new mongoose.Types.ObjectId(value);
+}
 
 export async function createOrUpdatePendingSubscription({
   shopId,
@@ -59,11 +74,26 @@ export async function createOrUpdatePendingSubscription({
         status: "pending",
         currentPeriodStart: now,
         currentPeriodEnd: periodEnd,
-        isTrialUsed: isEligibleForTrial,
-
-        paymobSubscriptionId: undefined,
-        paymobTransactionId: undefined,
-        cancelledAt: undefined,
+        // A latch, never a straight assignment. There is one subscription row
+        // per shop, so `previousSubWithTrial` above reads the very row this
+        // update overwrites: assigning `isEligibleForTrial` here made the
+        // second subscription (correctly refused a trial) erase the evidence
+        // that the first had taken one, leaving the third eligible again. A
+        // shop could lapse and re-subscribe for free 14 days indefinitely.
+        isTrialUsed: Boolean(previousSubWithTrial) || isEligibleForTrial,
+      },
+      // Must be $unset, not `$set: { field: undefined }`. Mongoose 6 removed
+      // `omitUndefined`, so an undefined value is stripped from the update
+      // rather than clearing the field — these three kept their previous
+      // values. That silently orphaned every re-subscription: the webhook
+      // handler skips storing a new Paymob id when one is already present, so
+      // renewals, suspensions and cancellations all went on addressing the
+      // shop's *previous* Paymob subscription, and cancelling posted the stale
+      // id while the live recurring mandate kept running.
+      $unset: {
+        paymobSubscriptionId: "",
+        paymobTransactionId: "",
+        cancelledAt: "",
       },
     },
     { upsert: true, new: true, setDefaultsOnInsert: true },
@@ -138,11 +168,20 @@ export async function getAllSubscriptions(filters: {
   const { page = 1, limit = 10, userId, status, planId, search = "" } = filters;
   const skip = (page - 1) * limit;
 
-  // Build filter object
+  // Build filter object.
+  //
+  // The two id filters must be cast by hand. This filter is handed to
+  // `$match` inside an aggregation, and unlike `find()`, aggregate does no
+  // schema casting — a string compared against a stored ObjectId simply never
+  // matches. Both filters therefore returned an empty list with
+  // `totalCount: 0` for every input, correct ones included, which reads to an
+  // admin as "this customer has no subscriptions" rather than as a failure.
+  // `status` is a string in the schema too, so it was unaffected, which is
+  // why the endpoint looked like it worked.
   const filter: FilterQuery<ISubscription> = {};
-  if (userId) filter.userId = userId;
+  if (userId) filter.userId = toObjectId(userId, "userId");
   if (status) filter.status = status;
-  if (planId) filter.plan = planId;
+  if (planId) filter.plan = toObjectId(planId, "planId");
 
   // Search by user email, shop name, or plan title
   const aggregatePipeline: PipelineStage[] = [

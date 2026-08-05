@@ -38,7 +38,16 @@ function omitSensitiveUserFields<T extends object>(
 }
 
 // Utility functions
-async function findUserByEmail(
+
+/**
+ * Looks a user up by email, returning `null` when there is no match.
+ *
+ * Use this — not `findUserByEmail` — on any endpoint an unauthenticated caller
+ * can reach with an arbitrary address. Throwing USER_NOT_FOUND there turns the
+ * endpoint into an oracle for "is this address registered", which is the input
+ * to credential stuffing and targeted phishing.
+ */
+async function findUserByEmailOrNull(
   email: string,
   includePassword = false,
   includeRole = true,
@@ -59,11 +68,38 @@ async function findUserByEmail(
     query = query.populate("shop");
   }
 
-  const user = await query.lean();
+  return query.lean();
+}
+
+async function findUserByEmail(
+  email: string,
+  includePassword = false,
+  includeRole = true,
+  includeShop = true,
+) {
+  const user = await findUserByEmailOrNull(
+    email,
+    includePassword,
+    includeRole,
+    includeShop,
+  );
   if (!user) {
     throw new Errors.NotFoundError(errMsg.USER_NOT_FOUND);
   }
   return user;
+}
+
+/**
+ * A bcrypt hash of a value no user can hold, compared against when the supplied
+ * address is not registered. Without it the unknown-address path skips bcrypt
+ * entirely and answers in a fraction of the time a real comparison takes, which
+ * leaves the enumeration oracle open on the clock even once the error bodies
+ * match. Computed once, lazily, at the configured cost factor.
+ */
+let dummyPasswordHash: Promise<string> | null = null;
+function getDummyPasswordHash() {
+  dummyPasswordHash ??= hash("not-a-real-password", SALT_ROUNDS);
+  return dummyPasswordHash;
 }
 
 async function generateVerificationCode(
@@ -136,12 +172,27 @@ export async function signUp(userData: {
   ).catch(console.error);
 }
 
+/**
+ * The only OTP reason this endpoint will honour. Both flows write to the same
+ * single `verificationCode` slot on the user, so without this check a
+ * password_reset code satisfied every remaining test here and was exchanged for
+ * a full session — a reset code became a login credential, and the reset flow
+ * doubled as an email-verification bypass for someone who never set a password.
+ * A reset code authorises `resetPassword` and nothing else.
+ */
+const VERIFIABLE_REASON = "account_verification";
+
 export async function verifyCode(verificationData: {
   email: string;
   code: string;
   reason: string;
 }) {
   const { code, reason } = verificationData;
+
+  if (reason !== VERIFIABLE_REASON) {
+    throw new Errors.BadRequestError(errMsg.INVALID_VERIFICATION_REASON);
+  }
+
   const user = await findUserByEmail(verificationData.email);
 
   const vCode = user.verificationCode;
@@ -185,10 +236,23 @@ export async function verifyCode(verificationData: {
 }
 
 export async function resendVerificationCode(userData: { email: string }) {
-  const user = await findUserByEmail(userData.email);
+  // Same answer in all three cases — unregistered, already verified, and
+  // genuinely resent. Previously these were 404, 400 and 200 respectively,
+  // which let an anonymous caller not only test whether an address was
+  // registered but also read back its verification state.
+  const genericResponse = {
+    message: "A new verification code has been sent to your email.",
+  };
 
-  if (user.isVerified) {
-    throw new Errors.BadRequestError(errMsg.USER_ALREADY_VERIFIED);
+  const user = await findUserByEmailOrNull(userData.email);
+
+  // The guard that matters is unchanged, only its visibility: an already-
+  // verified account must never have a fresh OTP written onto it and mailed
+  // out, or an anonymous caller could keep re-arming a live account's
+  // verification slot indefinitely. Doing nothing and reporting success is
+  // what keeps that protection without announcing which case applied.
+  if (!user || user.isVerified) {
+    return genericResponse;
   }
 
   const verificationCode = await generateVerificationCode(
@@ -200,28 +264,44 @@ export async function resendVerificationCode(userData: { email: string }) {
     $set: { verificationCode },
   });
 
+  // Deliberately awaited rather than fire-and-forget: a user whose mail
+  // genuinely fails to send should be told, rather than being left waiting for
+  // a code that was never dispatched. The residual signal this leaves — a
+  // broken mail transport would fail for real addresses while unknown ones
+  // still return 200 — needs SMTP to be down to say anything, and is not
+  // something an attacker can provoke per-address.
   await sendEmail(
     user.email,
     "Your New Verification Code",
     `Your new verification code is: <b>${verificationCode.code}</b>. It will expire in 10 minutes.`,
   );
 
-  return { message: "A new verification code has been sent to your email." };
+  return genericResponse;
 }
 
 export async function login(loginData: { email: string; password: string }) {
   const { email, password } = loginData;
 
   // Find user with password included
-  const user = await findUserByEmail(email, true);
+  const user = await findUserByEmailOrNull(email, true);
 
-  if (!user.isVerified) {
-    throw new Errors.UnauthenticatedError(errMsg.ACCOUNT_NOT_VERIFIED);
+  // An unregistered address and a registered one with the wrong password must
+  // be indistinguishable — same error, same status, same body, and (via the
+  // dummy hash) the same amount of work. Anything else lets an anonymous caller
+  // enumerate the user base one address at a time.
+  const isMatch = await compare(
+    password,
+    user ? user.password : await getDummyPasswordHash(),
+  );
+  if (!user || !isMatch) {
+    throw new Errors.UnauthorizedError(errMsg.INVALID_EMAIL_OR_PASSWORD);
   }
 
-  const isMatch = await compare(password, user.password);
-  if (!isMatch) {
-    throw new Errors.UnauthorizedError(errMsg.INVALID_EMAIL_OR_PASSWORD);
+  // Deliberately *after* the password check: answering "this account is not
+  // verified" to someone who has not proved they own the credentials would
+  // reinstate the same oracle the check above closes.
+  if (!user.isVerified) {
+    throw new Errors.UnauthenticatedError(errMsg.ACCOUNT_NOT_VERIFIED);
   }
 
   const { accessToken, refreshToken } = await generateTokens(user);
@@ -237,7 +317,18 @@ export async function login(loginData: { email: string; password: string }) {
 }
 
 export async function forgotPassword(userData: { email: string }) {
-  const user = await findUserByEmail(userData.email);
+  // The same answer is returned whether or not the address is registered. This
+  // endpoint needs no credentials at all, so a 404 here would hand anyone a
+  // free membership check against the whole user base.
+  const genericResponse = {
+    message: "A password reset code has been sent to your email.",
+  };
+
+  const user = await findUserByEmailOrNull(userData.email);
+  if (!user) {
+    return genericResponse;
+  }
+
   const verificationCode = await generateVerificationCode("password_reset");
 
   await Users.findByIdAndUpdate(user._id, {
@@ -250,7 +341,7 @@ export async function forgotPassword(userData: { email: string }) {
     `Your password reset code is: <b>${verificationCode.code}</b>. It will expire in 10 minutes.`,
   );
 
-  return { message: "A password reset code has been sent to your email." };
+  return genericResponse;
 }
 
 export async function resetPassword(resetData: {
@@ -261,8 +352,12 @@ export async function resetPassword(resetData: {
   const { code, newPassword } = resetData;
   const email = resetData.email.toLowerCase();
   const user = await Users.findOne({ email }).lean();
+  // An unregistered address gets the same answer as a registered one with no
+  // reset pending — both are truthfully "there is no reset code for this
+  // address". A 404 here would undo the generic response forgotPassword now
+  // returns, since an attacker could just enumerate through this endpoint.
   if (!user) {
-    throw new Errors.NotFoundError(errMsg.USER_NOT_FOUND);
+    throw new Errors.BadRequestError(errMsg.NO_VERIFICATION_CODE_FOUND);
   }
 
   const vCode = user.verificationCode;

@@ -9,7 +9,6 @@ import type {
 import type {
   EmptyDataResponse,
   LoginResponse,
-  RefreshTokenResponse,
   VerifyCodeResponse,
 } from "@/types/auth";
 
@@ -48,14 +47,9 @@ export const authApi = {
       .then((res) => res.data);
   },
 
-  // Takes no payload: the refresh token is sent automatically as the httpOnly
-  // cookie. Note that most refreshes go through refreshAccessToken() in
-  // axiosInint.ts instead, which dedupes concurrent calls and bypasses the
-  // interceptors.
-  refresh: (): Promise<RefreshTokenResponse> => {
-    return axiosInstance.post("/auth/refresh").then((res) => res.data);
-  },
-
+  // Note: there is deliberately no refresh() here. Every token refresh goes
+  // through refreshAccessToken() in axiosInint.ts, which dedupes concurrent
+  // calls and bypasses the interceptors to avoid recursive refresh attempts.
   signout: (): Promise<EmptyDataResponse> => {
     return axiosInstance.post("/auth/signout").then((res) => res.data);
   },

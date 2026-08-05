@@ -1,0 +1,58 @@
+name: Bug report
+description: Something behaves differently from how it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please don't report security vulnerabilities here — see [SECURITY.md](https://github.com/SaraAboElenien/gahezlak-v2/blob/main/.github/SECURITY.md) for private reporting.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that triggers it. Include the route or endpoint if you know it.
+      placeholder: |
+        1. Sign in as a shop owner
+        2. Go to Dashboard → Menu
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where
+      options:
+        - Backend (API)
+        - Frontend (web)
+        - Both / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs, errors or screenshots
+      description: |
+        Anything from the browser console, the API logs, or the network tab.
+        Redact tokens, cookies and personal data before pasting.
+    validations:
+      required: false
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Node version, browser, and whether this was local or deployed.
+      placeholder: "Node 22.14, Chrome 141, local dev"
+    validations:
+      required: false

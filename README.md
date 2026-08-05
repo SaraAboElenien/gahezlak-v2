@@ -8,7 +8,7 @@ Diners scan a code at the table, browse a bilingual menu on their phone, and pay
 Restaurants get a dashboard for menus, staff, live orders and analytics — on a subscription platform that bills itself.
 
 [![CI](https://github.com/SaraAboElenien/gahezlak-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/SaraAboElenien/gahezlak-v2/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-432%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
 ![Node](https://img.shields.io/badge/Node-22.x-5FA04E?logo=node.js&logoColor=white)

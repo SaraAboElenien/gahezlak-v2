@@ -22,25 +22,45 @@ Restaurants get a dashboard for menus, staff, live orders and analytics — on a
 
 <div align="center">
 
-### The customer journey
+<img src="docs/screenshots/01.png" alt="Gahezlak screenshot" width="900">
 
-| Scan &amp; browse | Build an order | Checkout |
-| :---: | :---: | :---: |
-| <img src="docs/screenshots/menu-mobile.png" alt="Public menu on a phone, showing categories and dishes in Arabic and English" width="260"> | <img src="docs/screenshots/cart.png" alt="Cart with item options, quantities and a running total" width="260"> | <img src="docs/screenshots/checkout.png" alt="Checkout screen offering card, mobile wallet and cash" width="260"> |
+<img src="docs/screenshots/02.png" alt="Gahezlak screenshot" width="900">
 
-### The restaurant dashboard
+<img src="docs/screenshots/03.png" alt="Gahezlak screenshot" width="900">
 
-| Live orders | Menu management | Analytics |
-| :---: | :---: | :---: |
-| <img src="docs/screenshots/dashboard-orders.png" alt="Orders board with status transitions" width="280"> | <img src="docs/screenshots/dashboard-menu.png" alt="Menu editor with categories, prices, options and availability" width="280"> | <img src="docs/screenshots/dashboard-analytics.png" alt="Revenue and order-volume charts" width="280"> |
+<img src="docs/screenshots/04.png" alt="Gahezlak screenshot" width="900">
 
-<br>
+<img src="docs/screenshots/05.png" alt="Gahezlak screenshot" width="900">
 
-<img src="docs/screenshots/landing.png" alt="Gahezlak landing page" width="820">
+<img src="docs/screenshots/06.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/07.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/08.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/09.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/10.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/11.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/12.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/13.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/14.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/15.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/16.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/17.png" alt="Gahezlak screenshot" width="900">
+
+<img src="docs/screenshots/18.png" alt="Gahezlak screenshot" width="900">
 
 </div>
 
-> Every screen is fully bilingual: switching to Arabic flips the entire interface to right-to-left, not just the copy.
+> Every screen is fully bilingual — the العربية toggle flips the entire interface to right-to-left, not just the copy.
 
 ---
 

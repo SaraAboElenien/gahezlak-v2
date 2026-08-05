@@ -401,6 +401,67 @@ describe("updateShop", () => {
     expect((await Shops.findById(shop._id).lean())?.address.city).toBe("Giza");
   });
 
+  /**
+   * REGRESSION (2026-08-05): the allowlist that closed the mass-assignment
+   * hole below was written from `updateShopValidator`, which does not name
+   * `type` — and `logoUrl` never appears in a validator at all, because
+   * `updateShopHandler` derives it from the uploaded file rather than the body.
+   * Both were therefore stripped from every update while the request still
+   * returned 200 with a success message, so a shop owner changing their logo
+   * saw a success toast and no change.
+   *
+   * The test above kept passing because it happened to assert only
+   * `phoneNumber` and `address`. An allowlist needs its permissive direction
+   * tested as deliberately as its restrictive one: this asserts every field
+   * `useRestaurantForm.ts` actually submits, so adding a field to the form
+   * without adding it to the allowlist fails here instead of in production.
+   */
+  it("persists every field the shop edit form submits", async () => {
+    const { updateShop } = await shopService();
+    const shop = await seedShop();
+
+    const updated = await updateShop(shop._id.toString(), {
+      name: "Renamed Bistro",
+      type: "cafe",
+      email: "new@example.com",
+      phoneNumber: "01055555555",
+      address: { country: "EG", city: "Giza", street: "9 Nile St" },
+      // Set server-side by the handler from the imgbb upload, not by the body.
+      logoUrl: "https://i.ibb.co/new-logo.png",
+    });
+
+    expect(updated.name).toBe("Renamed Bistro");
+    expect(updated.type).toBe("cafe");
+    expect(updated.email).toBe("new@example.com");
+    expect(updated.phoneNumber).toBe("01055555555");
+    expect(updated.address.city).toBe("Giza");
+    expect(updated.logoUrl).toBe("https://i.ibb.co/new-logo.png");
+
+    // Read back from the database rather than trusting the returned document:
+    // the bug being pinned was a dropped *write* that still returned a
+    // plausible-looking response.
+    const stored = await Shops.findById(shop._id).lean();
+    expect(stored?.type).toBe("cafe");
+    expect(stored?.logoUrl).toBe("https://i.ibb.co/new-logo.png");
+  });
+
+  it("leaves the existing logo alone when an edit uploads no new one", async () => {
+    const { updateShop } = await shopService();
+    const shop = await seedShop();
+    await updateShop(shop._id.toString(), {
+      logoUrl: "https://i.ibb.co/original.png",
+    });
+
+    // The handler sends `logoUrl: undefined` whenever no file was uploaded, so
+    // an ordinary text-only edit must not wipe the logo the shop already has.
+    const updated = await updateShop(shop._id.toString(), {
+      name: "Text Only Edit",
+      logoUrl: undefined,
+    });
+
+    expect(updated.logoUrl).toBe("https://i.ibb.co/original.png");
+  });
+
   it("throws for a shop that does not exist", async () => {
     const { updateShop } = await shopService();
 

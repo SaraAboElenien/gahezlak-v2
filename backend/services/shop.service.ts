@@ -104,13 +104,26 @@ async function getShop({
  * them), moving `ownerId` also stops `getUserShop` resolving for the real
  * owner, whose subscription-gated dashboard then closes entirely.
  *
- * Anything added here must be a field an ordinary shop editor may set.
+ * Anything added here must be a field an ordinary shop editor may set — and
+ * conversely, this list must cover *every* field the update form legitimately
+ * sends, or the write is silently dropped while the request still returns 200.
+ * Both halves are pinned by tests: one asserts the escalation is refused, the
+ * other asserts an ordinary edit of every UI-supplied field persists.
+ *
+ * `logoUrl` is safe here even though it is not in `updateShopValidator`,
+ * because it is never taken from the request body: `updateShopHandler` spreads
+ * it *after* `...req.body`, deriving it from the uploaded file's imgbb URL, and
+ * sets it to `undefined` when no file was uploaded — which clobbers any
+ * client-supplied value and is then skipped by the copy below, so an edit
+ * without a new logo leaves the existing one alone.
  */
 const UPDATABLE_SHOP_FIELDS = [
   "name",
+  "type",
   "address",
   "phoneNumber",
   "email",
+  "logoUrl",
 ] as const satisfies readonly (keyof IShop)[];
 
 function pickUpdatableShopFields(shopData: Partial<IShop>): Partial<IShop> {

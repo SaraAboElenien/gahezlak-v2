@@ -28,6 +28,21 @@ interface AiAllergyNoticeProps {
  * Deliberately styled as a warning rather than the 10px grey italic it
  * replaces: a disclaimer nobody reads protects nobody.
  */
+/**
+ * Arabic number agreement for "dish".
+ *
+ * Arabic does not have one plural: 1 and 2 have their own forms, 3–10 take the
+ * plural (أصناف), and 11 upwards take the accusative singular (صنفًا). Writing
+ * `${n} صنفًا` for every value — as this component first did — is wrong for
+ * exactly the range a hidden-dish count usually falls in.
+ */
+function arabicDishCount(n: number): string {
+  if (n === 1) return "صنف واحد";
+  if (n === 2) return "صنفان";
+  if (n >= 3 && n <= 10) return `${n} أصناف`;
+  return `${n} صنفًا`;
+}
+
 const AiAllergyNotice = ({
   currentLang,
   hiddenCount,
@@ -50,7 +65,7 @@ const AiAllergyNotice = ({
         {hiddenCount > 0 && (
           <p className="mt-1 opacity-90">
             {isAr
-              ? `تم إخفاء ${hiddenCount} صنفًا لعدم توفر معلومات كافية للتأكد من أنها آمنة — وهذا لا يعني بالضرورة أنها غير آمنة. اسأل المطعم عنها.`
+              ? `تم إخفاء ${arabicDishCount(hiddenCount)} لعدم توفر معلومات كافية للتأكد من أنها آمنة — وهذا لا يعني بالضرورة أنها غير آمنة. اسأل المطعم عنها.`
               : `${hiddenCount} ${hiddenCount === 1 ? "dish is" : "dishes are"} hidden because we don't have enough information to call ${hiddenCount === 1 ? "it" : "them"} safe — that doesn't necessarily mean ${hiddenCount === 1 ? "it is" : "they are"} unsafe. Ask the restaurant.`}
           </p>
         )}

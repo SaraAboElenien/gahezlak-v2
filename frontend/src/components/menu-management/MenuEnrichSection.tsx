@@ -24,12 +24,44 @@ const MenuEnrichSection = () => {
   const [summary, setSummary] = useState<EnrichSummaryResponse["data"] | null>(
     null,
   );
+  const [progress, setProgress] = useState<{
+    done: number;
+    remaining: number;
+  } | null>(null);
   const { mutateAsync: enrich, isPending } = useEnrichShopMenu();
 
   const run = async (force: boolean) => {
     setSummary(null);
+    setProgress(null);
     try {
-      const response = await enrich(force);
+      // The backend caps how many items it enriches per request so a large
+      // menu can't become a multi-minute POST that a proxy kills. Keep going
+      // until it reports nothing left, accumulating the totals — and only
+      // `force` the first pass, or each subsequent one would redo the work the
+      // previous pass just did.
+      const totals = { processed: 0, failed: 0, skipped: 0, remaining: 0 };
+      const errors: EnrichSummaryResponse["data"]["errors"] = [];
+      let pass = 0;
+
+      for (;;) {
+        const { data } = await enrich(pass === 0 ? force : false);
+        totals.processed += data.processed;
+        totals.failed += data.failed;
+        totals.skipped = data.skipped;
+        totals.remaining = data.remaining;
+        errors.push(...data.errors);
+        pass++;
+
+        if (data.remaining <= 0) break;
+        setProgress({ done: totals.processed, remaining: data.remaining });
+
+        // A pass that achieved nothing would otherwise loop forever — e.g.
+        // every item failing on an expired API key.
+        if (data.processed === 0) break;
+      }
+
+      const response = { data: { ...totals, errors } };
+      setProgress(null);
       setSummary(response.data);
       if (response.data.processed > 0) {
         toast.success(
@@ -114,17 +146,25 @@ const MenuEnrichSection = () => {
         </div>
       </div>
 
-      {/* A long menu is one API call per dish, run one at a time, so this is
-          slow enough that silence looks like a hang. */}
+      {/* One paid API call per dish, so a full menu takes long enough that
+          silence reads as a hang. Once the first batch comes back we can show
+          real numbers instead of a vague reassurance. */}
       {isPending && (
         <p
           className="mt-4 text-sm text-gray-500 dark:text-gray-400"
           role="status"
+          aria-live="polite"
         >
-          {t("menu.enrichPatience", {
-            defaultValue:
-              "This analyses one dish at a time and can take a minute or two on a large menu. Leave this page open.",
-          })}
+          {progress
+            ? t("menu.enrichProgress", {
+                done: progress.done,
+                remaining: progress.remaining,
+                defaultValue: `Analysed ${progress.done} so far, ${progress.remaining} to go…`,
+              })
+            : t("menu.enrichPatience", {
+                defaultValue:
+                  "This analyses each dish separately and can take a minute or two on a large menu. Leave this page open.",
+              })}
         </p>
       )}
 

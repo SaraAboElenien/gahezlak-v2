@@ -198,42 +198,106 @@ export interface BulkEnrichSummary {
   processed: number;
   failed: number;
   skipped: number;
+  /**
+   * Items still needing enrichment after this call returned. Non-zero means
+   * the batch cap was hit — call again to continue.
+   */
+  remaining: number;
   errors: Array<{ menuItemId: string; message: string }>;
 }
 
 /**
- * Enriches every menu item in a shop.
+ * How many items one call will process before returning.
  *
- * Deliberately sequential. These calls are not latency-sensitive (this runs
- * from a dashboard action, not a customer request), and firing a whole menu's
- * worth of requests in parallel is the reliable way to hit a rate limit and
- * fail most of them. One failure never aborts the run — the summary reports
- * what didn't work so the caller can retry just those.
+ * Exists because this runs inside a single HTTP request from a dashboard
+ * button. Measured on a real 42-item menu: 228s on claude-opus-5, 66s on
+ * claude-haiku-4-5. A four-minute synchronous POST does not survive a proxy,
+ * a load balancer, or a laptop lid closing — and the menu that breaks it is
+ * the *large* one, i.e. the customer who most needs the feature.
+ *
+ * The work was already idempotent and resumable (an item that already has
+ * data is skipped), so capping it costs nothing but one more round trip.
+ */
+const DEFAULT_BATCH_LIMIT = 25;
+
+/**
+ * Concurrent Claude calls.
+ *
+ * This used to be strictly sequential, on the reasoning that firing a whole
+ * menu's worth of requests at once is the reliable way to hit a rate limit.
+ * That is still true of "a whole menu at once"; a fixed small pool is not the
+ * same thing. Four keeps a 25-item batch to roughly 35s on Opus while staying
+ * well inside the request-per-minute allowance, and per-item error isolation
+ * means a rate-limited item is reported and picked up on the next run rather
+ * than losing the batch.
+ */
+const DEFAULT_CONCURRENCY = 4;
+
+/**
+ * Runs `worker` over `items` with at most `concurrency` in flight.
+ *
+ * Hand-rolled rather than pulled in: it is a dozen lines, and a dependency
+ * here would be a supply-chain surface on the one path that holds an API key.
+ */
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let cursor = 0;
+  const runners = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (cursor < items.length) {
+        const item = items[cursor++];
+        await worker(item);
+      }
+    },
+  );
+  await Promise.all(runners);
+}
+
+/**
+ * Enriches a shop's menu, up to `limit` items per call.
+ *
+ * One failure never aborts the run — the summary reports what didn't work so
+ * the caller can retry just those, and a plain re-run skips everything that
+ * already succeeded.
  */
 export async function enrichShopMenu(
   shopId: string | Types.ObjectId,
-  options: { force?: boolean } = {},
+  options: { force?: boolean; limit?: number; concurrency?: number } = {},
 ): Promise<BulkEnrichSummary> {
+  const limit = Math.max(1, options.limit ?? DEFAULT_BATCH_LIMIT);
+  const concurrency = Math.max(1, options.concurrency ?? DEFAULT_CONCURRENCY);
+
   const items = await MenuItemModel.find({ shopId }).select("_id");
+
+  // One query for the whole menu rather than one per item inside the loop:
+  // the old shape issued a findOne per dish purely to decide whether to skip
+  // it, which on an already-enriched menu was 42 round trips to do nothing.
+  let pending = items;
+  let alreadyDone = 0;
+  if (!options.force) {
+    const done = await AIMenuDataModel.find({ shopId, aiProcessed: true })
+      .select("menuItemId")
+      .lean();
+    const doneIds = new Set(done.map((d) => d.menuItemId.toString()));
+    pending = items.filter((i) => !doneIds.has(i._id.toString()));
+    alreadyDone = items.length - pending.length;
+  }
+
+  const batch = pending.slice(0, limit);
+
   const summary: BulkEnrichSummary = {
     processed: 0,
     failed: 0,
-    skipped: 0,
+    skipped: alreadyDone,
+    remaining: pending.length - batch.length,
     errors: [],
   };
 
-  for (const item of items) {
-    if (!options.force) {
-      const existing = await AIMenuDataModel.findOne({
-        menuItemId: item._id,
-        aiProcessed: true,
-      }).select("_id");
-      if (existing) {
-        summary.skipped++;
-        continue;
-      }
-    }
-
+  await mapWithConcurrency(batch, concurrency, async (item) => {
     try {
       // `.toString()` rather than the raw _id: MenuItem types its id as
       // mongodb's ObjectId while this signature takes mongoose's, and the two
@@ -251,7 +315,7 @@ export async function enrichShopMenu(
         "Menu item enrichment failed",
       );
     }
-  }
+  });
 
   return summary;
 }

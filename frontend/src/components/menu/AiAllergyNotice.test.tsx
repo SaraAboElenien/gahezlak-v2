@@ -62,3 +62,21 @@ describe("AiAllergyNotice", () => {
     expect(note).toHaveTextContent(/3/);
   });
 });
+
+describe("AiAllergyNotice — Arabic number agreement", () => {
+  /**
+   * Arabic has no single plural form. The first version of this component
+   * wrote `${n} صنفًا` for every value, which is correct only from 11 up — and
+   * wrong for 3–10, the range a hidden-dish count usually lands in.
+   */
+  it.each([
+    [1, "صنف واحد"],
+    [2, "صنفان"],
+    [5, "5 أصناف"],
+    [12, "12 صنفًا"],
+  ])("renders %i correctly", (count, expected) => {
+    render(<AiAllergyNotice currentLang="ar" hiddenCount={count} />);
+
+    expect(screen.getByRole("note")).toHaveTextContent(expected);
+  });
+});

@@ -334,3 +334,130 @@ describe("enrichShopMenu", () => {
     ).toBeNull();
   });
 });
+
+describe("enrichShopMenu — batching and concurrency", () => {
+  /**
+   * These exist because this runs inside one HTTP request from a dashboard
+   * button. Measured on a real 42-item menu: 228s on claude-opus-5. A
+   * four-minute synchronous POST does not survive a proxy or a load balancer,
+   * and the menu that breaks it is the large one — i.e. the customer who most
+   * needs the feature.
+   */
+  it("stops at the batch limit and reports what is left", async () => {
+    const { enrichShopMenu } =
+      await import("../../services/ai/menu-enrich.service");
+    for (let i = 0; i < 5; i++) await seedItem(`Dish ${i}`);
+    mockEnrichment({});
+
+    const summary = await enrichShopMenu(shopId.toString(), { limit: 2 });
+
+    expect(summary.processed).toBe(2);
+    expect(summary.remaining).toBe(3);
+    expect(createMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("resumes where it left off, without redoing finished items", async () => {
+    const { enrichShopMenu } =
+      await import("../../services/ai/menu-enrich.service");
+    for (let i = 0; i < 5; i++) await seedItem(`Dish ${i}`);
+    mockEnrichment({});
+
+    await enrichShopMenu(shopId.toString(), { limit: 2 });
+    const second = await enrichShopMenu(shopId.toString(), { limit: 2 });
+    const third = await enrichShopMenu(shopId.toString(), { limit: 2 });
+
+    // The resumability the cap depends on: a re-run skips what already has
+    // data, so continuing costs one round trip rather than the whole menu.
+    expect(second.processed).toBe(2);
+    expect(second.skipped).toBe(2);
+    expect(third.processed).toBe(1);
+    expect(third.remaining).toBe(0);
+    expect(createMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("reports nothing remaining once the menu is fully enriched", async () => {
+    const { enrichShopMenu } =
+      await import("../../services/ai/menu-enrich.service");
+    await seedItem("Only dish");
+    mockEnrichment({});
+
+    await enrichShopMenu(shopId.toString());
+    const again = await enrichShopMenu(shopId.toString());
+
+    expect(again.processed).toBe(0);
+    expect(again.skipped).toBe(1);
+    expect(again.remaining).toBe(0);
+  });
+
+  it("never exceeds the configured concurrency", async () => {
+    const { enrichShopMenu } =
+      await import("../../services/ai/menu-enrich.service");
+    for (let i = 0; i < 8; i++) await seedItem(`Dish ${i}`);
+
+    let inFlight = 0;
+    let peak = 0;
+    createMock.mockImplementation(async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      return {
+        stop_reason: "end_turn",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              ingredients: [],
+              allergens: [],
+              dietaryTags: [],
+            }),
+          },
+        ],
+      };
+    });
+
+    const summary = await enrichShopMenu(shopId.toString(), {
+      concurrency: 3,
+    });
+
+    // The bound is the whole point: unbounded parallelism over a full menu is
+    // the reliable way to hit a rate limit and fail most of the batch.
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(peak).toBeGreaterThan(1);
+    expect(summary.processed).toBe(8);
+  });
+
+  it("keeps isolating failures when running concurrently", async () => {
+    const { enrichShopMenu } =
+      await import("../../services/ai/menu-enrich.service");
+    for (let i = 0; i < 4; i++) await seedItem(`Dish ${i}`);
+
+    let call = 0;
+    createMock.mockImplementation(async () => {
+      call++;
+      if (call === 2) throw new Error("rate limited");
+      return {
+        stop_reason: "end_turn",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              ingredients: [],
+              allergens: [],
+              dietaryTags: [],
+            }),
+          },
+        ],
+      };
+    });
+
+    const summary = await enrichShopMenu(shopId.toString(), {
+      concurrency: 2,
+    });
+
+    // A rejected promise inside the pool must not abandon the other workers.
+    expect(summary.processed).toBe(3);
+    expect(summary.failed).toBe(1);
+    expect(summary.errors).toHaveLength(1);
+  });
+});

@@ -59,6 +59,12 @@ export interface EnrichSummaryResponse {
     processed: number;
     failed: number;
     skipped: number;
+    /**
+     * Items still needing enrichment when this call returned. The backend caps
+     * how many it processes per request so a large menu cannot turn into a
+     * multi-minute POST; non-zero means call again to continue.
+     */
+    remaining: number;
     errors: Array<{ menuItemId: string; message: string }>;
   };
 }

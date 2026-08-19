@@ -1,6 +1,10 @@
 import { Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
-import { Subscriptions, SubscriptionStatus } from "../models/Subscription";
+import {
+  Subscriptions,
+  SubscriptionStatus,
+  isEntitledToService,
+} from "../models/Subscription";
 import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
 import { getUserShop } from "../services/shop.service";
@@ -16,17 +20,21 @@ export async function assertShopHasActiveSubscription(
     throw new Errors.NotAllowedError(errMsg.NO_SUBSCRIPTION_FOUND);
   }
 
+  // One shared rule rather than a second copy of it here — this gate admitting
+  // only ACTIVE/TRIALING while the re-subscribe guard honoured the cancellation
+  // grace period is what locked paid-up shops out of their own dashboards.
+  // See isEntitledToService in models/Subscription.ts.
+  if (isEntitledToService(subscription)) {
+    return;
+  }
+
+  // Past due is worth its own message: the shop can fix it by paying, which is
+  // not true of the others.
   if (subscription.status === SubscriptionStatus.EXPIRED) {
     throw new Errors.NotAllowedError(errMsg.SUBSCRIPTION_EXPIRED);
   }
 
-  if (
-    ![SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING].includes(
-      subscription.status,
-    )
-  ) {
-    throw new Errors.NotAllowedError(errMsg.NO_ACTIVE_SUBSCRIPTION);
-  }
+  throw new Errors.NotAllowedError(errMsg.NO_ACTIVE_SUBSCRIPTION);
 }
 
 export const checkActiveSubscrtion = async (

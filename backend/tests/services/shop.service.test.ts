@@ -915,7 +915,7 @@ describe("updateMemberRole", () => {
     expect(stored?.members[0].roleId.toString()).toBe(managerRoleId.toString());
   });
 
-  it("leaves the member's own role field untouched, so their permissions do not move", async () => {
+  it("moves the member's permissions, not just the roster label", async () => {
     const { updateMemberRole } = await shopService();
     const staff = await seedUser(staffRoleId);
     const shop = await seedShop({
@@ -928,16 +928,64 @@ describe("updateMemberRole", () => {
       managerRoleId.toString(),
     );
 
-    // CURRENT BEHAVIOUR, not desired behaviour: authorisation is decided by
-    // `isAllowed`, which reads the `role` claim in the access token, and that
-    // claim is signed from `Users.role` — never from `shop.members[].roleId`.
-    // So this endpoint moves only the label shown in the members table: a
-    // promoted staff member gains nothing, and, worse, a manager demoted for
-    // cause keeps every manager permission. The two fields are written
-    // together by registerShopMember and then allowed to drift. Reported; do
-    // not "fix" by changing this assertion.
+    // Authorisation is decided from `Users.role` — `isAllowed` resolves the
+    // caller's role through it — while `shop.members[].roleId` is only the
+    // label the members table shows. This assertion was previously inverted,
+    // pinning the bug as current behaviour: writing the label alone meant a
+    // promotion granted nothing and, worse, a manager demoted for cause kept
+    // every manager permission while the UI showed them as demoted. Both
+    // fields are now written in one transaction.
     const stored = await Users.findById(staff._id).lean();
-    expect(stored?.role?.toString()).toBe(staffRoleId.toString());
+    expect(stored?.role?.toString()).toBe(managerRoleId.toString());
+  });
+
+  it("demotes for real: the manager permission is gone from the user record", async () => {
+    const { updateMemberRole } = await shopService();
+    const manager = await seedUser(managerRoleId);
+    const shop = await seedShop({
+      members: [{ userId: oid(manager._id), roleId: managerRoleId }],
+    });
+
+    // The direction that actually matters. "Remove this person's manager
+    // rights" is the action taken when someone is leaving or has done
+    // something wrong, and it used to be a no-op.
+    await updateMemberRole(
+      shop._id.toString(),
+      manager._id.toString(),
+      staffRoleId.toString(),
+    );
+
+    const storedUser = await Users.findById(manager._id).lean();
+    const storedShop = await Shops.findById(shop._id).lean();
+    expect(storedUser?.role?.toString()).toBe(staffRoleId.toString());
+    expect(storedShop?.members[0].roleId.toString()).toBe(
+      staffRoleId.toString(),
+    );
+  });
+
+  it("does not touch the roster when the role id does not exist", async () => {
+    const { updateMemberRole } = await shopService();
+    const staff = await seedUser(staffRoleId);
+    const shop = await seedShop({
+      members: [{ userId: oid(staff._id), roleId: staffRoleId }],
+    });
+
+    // Two writes now happen together, so a rejection has to leave both alone
+    // rather than half-applying the change.
+    await expect(
+      updateMemberRole(
+        shop._id.toString(),
+        staff._id.toString(),
+        new mongoose.Types.ObjectId().toString(),
+      ),
+    ).rejects.toThrow();
+
+    const storedUser = await Users.findById(staff._id).lean();
+    const storedShop = await Shops.findById(shop._id).lean();
+    expect(storedUser?.role?.toString()).toBe(staffRoleId.toString());
+    expect(storedShop?.members[0].roleId.toString()).toBe(
+      staffRoleId.toString(),
+    );
   });
 
   it("refuses to change the owner's role", async () => {

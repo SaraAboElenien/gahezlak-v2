@@ -21,7 +21,16 @@ const createMock = vi.hoisted(() => vi.fn());
 vi.mock("../../config/claude", () => ({
   getClaudeClient: () => ({ messages: { create: createMock } }),
   aiEnabled: () => true,
-  AI_CONFIG: { MODEL: "claude-opus-5", MAX_TOKENS: 8000 },
+  AI_CONFIG: {
+    MODEL: "claude-opus-5",
+    ENRICH_MODEL: "claude-opus-5",
+    MAX_TOKENS: 8000,
+    EFFORT: "low",
+  },
+  outputConfig: (schema: unknown) => ({
+    effort: "low",
+    format: { type: "json_schema", schema },
+  }),
 }));
 
 /** A real JPEG of the given size — not a stub buffer. */

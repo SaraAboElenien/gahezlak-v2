@@ -268,11 +268,28 @@ services:
       # multiply per instance.
       - key: ANTHROPIC_API_KEY
         sync: false
-      # Optional. Defaults to claude-opus-5.
+      # Optional. Defaults to claude-opus-5. claude-haiku-4-5 is the cheapest
+      # model that still covers vision and the JSON schemas these features use.
       - key: AI_MODEL
+        sync: false
+      # Optional. Model for allergen/dietary enrichment only; falls back to
+      # AI_MODEL. Enrichment runs once per dish per menu change and decides
+      # whether a nut-allergic customer is shown a dish containing pesto;
+      # search runs once per visitor and is where the bill accrues. Haiku gave
+      # inconsistent allergen sets across runs, so pin this to claude-opus-5
+      # and leave AI_MODEL cheap. See backend/.env.example for the numbers.
+      - key: AI_ENRICH_MODEL
         sync: false
       # Optional, defaults to 8000. Caps thinking and response together.
       - key: AI_MAX_TOKENS
+        sync: false
+      # Optional, defaults to "low" (low/medium/high/xhigh/max/off). The main
+      # cost dial: all three AI features are fixed-schema extraction, so the
+      # API's own default of "high" burns thinking tokens for no gain. A bad
+      # value warns and falls back rather than failing every AI request.
+      # Note some models reject the parameter outright (haiku, sonnet-4-5);
+      # config/claude.ts omits it for those regardless of what is set here.
+      - key: AI_EFFORT
         sync: false
 
   # ===========================================================================

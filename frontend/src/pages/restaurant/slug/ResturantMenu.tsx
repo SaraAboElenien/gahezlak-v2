@@ -27,6 +27,7 @@ import { useTranslation } from "react-i18next";
 import getLocalizedText from "@/utils/getLocalizedText";
 import toast from "react-hot-toast";
 import { AI_ENABLED } from "@/config/features";
+import AiAllergyNotice from "@/components/menu/AiAllergyNotice";
 
 const RestaurantMenu: React.FC = () => {
   const { addToCart } = useCart();
@@ -43,6 +44,7 @@ const RestaurantMenu: React.FC = () => {
   const [displayedItems, setDisplayedItems] = useState<MenuItem[]>([]);
   const [originalItems, setOriginalItems] = useState<MenuItem[]>([]);
   const [AiSuccessMsg, setAiSuccessMsg] = useState<string>("");
+  const [aiHiddenCount, setAiHiddenCount] = useState<number>(0);
 
   const { slug } = useParams<{ slug: string }>();
   const { data: menuItems, isLoading: isMenuLoading } = usePublicMenuItems(
@@ -71,6 +73,10 @@ const RestaurantMenu: React.FC = () => {
       };
       const response = await searchWithAi(submittedData);
       setDisplayedItems(response.data.safeItems as MenuItem[]);
+      // Kept, not discarded: an excluded dish usually means "no allergen data
+      // for this one", and a customer shown an empty menu with no explanation
+      // reads it as "nothing here for me". AiAllergyNotice says which it is.
+      setAiHiddenCount(response.data.unsafeItems.length);
       setAiSuccessMsg(`${response.data.safeItems.length} AI recommended items`);
     } catch (err) {
       toast.error(
@@ -85,6 +91,7 @@ const RestaurantMenu: React.FC = () => {
   const handleClearAiSearch = () => {
     setAiSearchTerm("");
     setAiSuccessMsg("");
+    setAiHiddenCount(0);
     if (originalItems.length > 0) {
       setDisplayedItems(originalItems);
     }
@@ -279,11 +286,6 @@ const RestaurantMenu: React.FC = () => {
                               ? `${displayedItems.length} AI recommended items`
                               : `${displayedItems.length} عنصر موصى به من الذكاء الاصطناعي`}
                           </span>
-                          <span className="text-[10px] text-gray-500 dark:text-gray-400 italic mt-[-2px]">
-                            {currentLang === "en"
-                              ? "Results may not be 100% accurate"
-                              : "النتائج قد لا تكون دقيقة بنسبة 100%"}
-                          </span>
                         </>
                       )}
                     </div>
@@ -302,11 +304,6 @@ const RestaurantMenu: React.FC = () => {
                         {currentLang === "en"
                           ? `${displayedItems.length} AI recommended items`
                           : `${displayedItems.length} عنصر موصى به من الذكاء الاصطناعي`}
-                      </span>
-                      <span className="text-[10px] text-gray-500 dark:text-gray-400 italic ms-5">
-                        {currentLang === "en"
-                          ? "Results may not be 100% accurate"
-                          : "النتائج قد لا تكون دقيقة بنسبة 100%"}
                       </span>
                     </div>
                   )}
@@ -365,6 +362,17 @@ const RestaurantMenu: React.FC = () => {
                   </button>
                 </div>
               </div>
+
+              {/* Full-width and below the controls on purpose: the copy this
+                  replaces was 10px grey italic tucked beside the result count,
+                  on the one screen in the app where being wrong can hurt
+                  someone. Only shown once a search has actually run. */}
+              {AiSuccessMsg && (
+                <AiAllergyNotice
+                  currentLang={currentLang}
+                  hiddenCount={aiHiddenCount}
+                />
+              )}
             </div>
           )}
 

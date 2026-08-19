@@ -33,7 +33,16 @@ const createMock = vi.hoisted(() => vi.fn());
 vi.mock("../../config/claude", () => ({
   getClaudeClient: () => ({ messages: { create: createMock } }),
   aiEnabled: () => true,
-  AI_CONFIG: { MODEL: "claude-opus-5", MAX_TOKENS: 8000 },
+  AI_CONFIG: {
+    MODEL: "claude-opus-5",
+    ENRICH_MODEL: "claude-opus-5",
+    MAX_TOKENS: 8000,
+    EFFORT: "low",
+  },
+  outputConfig: (schema: unknown) => ({
+    effort: "low",
+    format: { type: "json_schema", schema },
+  }),
 }));
 
 function mockEnrichment(data: {
@@ -140,6 +149,75 @@ describe("enrichMenuItem", () => {
     const schema = createMock.mock.calls[0][0].output_config.format.schema;
     expect(schema.properties.allergens.items.enum).toContain("peanuts");
     expect(schema.properties.dietaryTags.items.enum).toContain("gluten-free");
+  });
+
+  it("sends the configured effort level, so a request cannot silently cost more", async () => {
+    const { enrichMenuItem } =
+      await import("../../services/ai/menu-enrich.service");
+    const item = await seedItem("Salad");
+    mockEnrichment({});
+
+    await enrichMenuItem(item._id.toString());
+
+    // Not cosmetic: omitting `effort` falls back to the API default of "high",
+    // which spends thinking tokens on what is a fixed-schema extraction. The
+    // bill goes up and nothing about the response looks different, so only an
+    // assertion on the outgoing request can catch the regression.
+    expect(createMock.mock.calls[0][0].output_config.effort).toBe("low");
+  });
+
+  it("refuses an item belonging to another shop, and calls no model", async () => {
+    const { MenuItemModel } = await import("../../models/MenuItem");
+    const { AIMenuDataModel } = await import("../../models/AIMenuData");
+    const { enrichMenuItem } =
+      await import("../../services/ai/menu-enrich.service");
+    const theirs = await MenuItemModel.create({
+      shopId: new mongoose.Types.ObjectId(),
+      categoryId,
+      name: { en: "Theirs", ar: "Theirs" },
+      price: 50,
+    });
+    mockEnrichment({});
+
+    // The route is POST /enrich/:itemId, so `isShopMember` never sees a shop
+    // id in the path and validates the caller against their *own* shop — which
+    // passes, and says nothing about this item. Without the scope argument any
+    // shop member could bill this account for writing a competitor's data.
+    await expect(
+      enrichMenuItem(theirs._id.toString(), { shopId: shopId.toString() }),
+    ).rejects.toThrow(/not found/i);
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(
+      await AIMenuDataModel.findOne({ menuItemId: theirs._id }),
+    ).toBeNull();
+  });
+
+  it("still enriches the caller's own item when scoped", async () => {
+    const { AIMenuDataModel } = await import("../../models/AIMenuData");
+    const { enrichMenuItem } =
+      await import("../../services/ai/menu-enrich.service");
+    const ours = await seedItem("Ours");
+    mockEnrichment({ allergens: ["dairy"] });
+
+    // The other half of the scope check. A guard that rejects everything would
+    // pass the test above on its own.
+    await enrichMenuItem(ours._id.toString(), { shopId: shopId.toString() });
+
+    const stored = await AIMenuDataModel.findOne({ menuItemId: ours._id });
+    expect(stored!.allergens).toContain("dairy");
+  });
+
+  it("rejects a malformed item id instead of throwing a cast error", async () => {
+    const { enrichMenuItem } =
+      await import("../../services/ai/menu-enrich.service");
+
+    // Reaches the service straight off the URL, so it is whatever the caller
+    // typed. An unguarded findOne turns this into a 500.
+    await expect(
+      enrichMenuItem("not-an-object-id", { shopId: shopId.toString() }),
+    ).rejects.toThrow(/not found/i);
+    expect(createMock).not.toHaveBeenCalled();
   });
 
   it("throws for a menu item that does not exist", async () => {

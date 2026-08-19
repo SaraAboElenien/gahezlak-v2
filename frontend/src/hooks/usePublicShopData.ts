@@ -1,5 +1,6 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { publicShopApi } from "@/services/publicShopApi";
+import type { EnrichSummaryResponse } from "@/types/menuItem";
 
 // Get public menu items
 export const usePublicMenuItems = (slug: string) => {
@@ -29,14 +30,26 @@ export const usePublicShopCategories = (slug: string) => {
 };
 
 // Ai
-// export const useBatchAiProcess = (shopId: string) => {
-//   return useMutation({
-//     mutationFn: () => publicShopApi.sendAllItemsToAi(shopId),
-//     onSuccess: (data) => {
-//       console.log("Batch AI Process Success:", data);
-//     },
-//   });
-// };
+
+/**
+ * Runs allergen / dietary / ingredient enrichment over the caller's whole menu.
+ *
+ * This is the step the AI search depends on. Until it has run for a shop, the
+ * search endpoint has nothing to filter on and correctly reports every match
+ * as unsafe — so the customer-facing feature looks broken rather than empty.
+ * Nothing triggers it automatically (each item is a paid API call), so the
+ * dashboard exposes it as an explicit action.
+ *
+ * Replaces a commented-out `useBatchAiProcess` that called an endpoint which
+ * no longer exists.
+ */
+export const useEnrichShopMenu = () => {
+  // `force` typed explicitly: a defaulted mutationFn parameter makes react-query
+  // infer TVariables as `void`, and callers then cannot pass anything at all.
+  return useMutation<EnrichSummaryResponse, Error, boolean>({
+    mutationFn: (force) => publicShopApi.enrichShopMenu(force),
+  });
+};
 
 export const useSearchWithAi = () => {
   return useMutation({

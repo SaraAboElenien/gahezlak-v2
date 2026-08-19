@@ -298,9 +298,37 @@ async function updateMemberRole(
     throw new Errors.NotFoundError(errMsg.MEMBER_NOT_FOUND);
   }
 
-  member.roleId = new mongoose.Types.ObjectId(roleId);
-  await shop.save();
-  return shop;
+  // `shop.members[].roleId` is a label; `Users.role` is what authorisation is
+  // actually decided from — `isAllowed` resolves the user's role through it.
+  // Writing only the first meant a demotion changed what the dashboard showed
+  // and nothing else: "remove this person's manager rights", the action taken
+  // when someone is leaving or has done something wrong, silently did nothing.
+  //
+  // Both writes or neither, and expressed as self-contained idempotent updates
+  // rather than mutating the `shop` document fetched above, since
+  // withTransaction may retry this callback — same reasoning as
+  // removeMemberFromShop.
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      await Shops.updateOne(
+        { _id: shopId, "members.userId": new mongoose.Types.ObjectId(userId) },
+        { $set: { "members.$.roleId": new mongoose.Types.ObjectId(roleId) } },
+        { session },
+      );
+      await Users.updateOne(
+        { _id: userId },
+        { $set: { role: new mongoose.Types.ObjectId(roleId) } },
+        { session },
+      );
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  const updatedShop = await Shops.findById(shopId);
+  if (!updatedShop) throw new Errors.NotFoundError(errMsg.SHOP_NOT_FOUND);
+  return updatedShop;
 }
 
 async function getShopById(shopId: string) {

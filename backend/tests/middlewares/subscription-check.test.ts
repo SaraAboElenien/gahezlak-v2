@@ -58,16 +58,40 @@ describe("assertShopHasActiveSubscription", () => {
     },
   );
 
-  it.each([SubscriptionStatus.PENDING, SubscriptionStatus.CANCELLED])(
-    "throws when status is %s",
-    async (status) => {
-      const shopId = new mongoose.Types.ObjectId();
-      await makeSubscription(status, shopId);
-      await expect(assertShopHasActiveSubscription(shopId)).rejects.toThrow(
-        NotAllowedError,
-      );
-    },
-  );
+  it("throws when status is pending", async () => {
+    const shopId = new mongoose.Types.ObjectId();
+    await makeSubscription(SubscriptionStatus.PENDING, shopId);
+    await expect(assertShopHasActiveSubscription(shopId)).rejects.toThrow(
+      NotAllowedError,
+    );
+  });
+
+  it("admits a cancelled subscription still inside its paid period", async () => {
+    // Previously this threw. Cancelling stops the renewal, not the month the
+    // shop already paid for — makeSubscription's currentPeriodEnd is 30 days
+    // out. The gate refusing here while the re-subscribe guard honoured the
+    // same grace period is what left paid-up shops unable to trade *and*
+    // unable to buy a replacement plan.
+    const shopId = new mongoose.Types.ObjectId();
+    await makeSubscription(SubscriptionStatus.CANCELLED, shopId);
+    await expect(
+      assertShopHasActiveSubscription(shopId),
+    ).resolves.toBeUndefined();
+  });
+
+  it("throws for a cancelled subscription whose paid period has ended", async () => {
+    const shopId = new mongoose.Types.ObjectId();
+    const sub = await makeSubscription(SubscriptionStatus.CANCELLED, shopId);
+    await Subscriptions.findByIdAndUpdate(sub._id, {
+      currentPeriodEnd: new Date(Date.now() - 24 * 60 * 60 * 1000),
+    });
+
+    // The other direction — without this, a gate that admitted every
+    // CANCELLED row would pass the test above and give service away forever.
+    await expect(assertShopHasActiveSubscription(shopId)).rejects.toThrow(
+      NotAllowedError,
+    );
+  });
 
   it("throws when status is expired", async () => {
     const shopId = new mongoose.Types.ObjectId();

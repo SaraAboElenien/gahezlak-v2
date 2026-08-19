@@ -40,13 +40,14 @@ export const publicShopApi = {
    *
    * Pass `force` to re-run over items that already have data (after editing
    * a menu item's description, say); the default skips them.
+   *
+   * No shopId argument: the backend takes it from the caller's token. The
+   * dashboard has no shop id in context — that is why this call previously
+   * had no caller anywhere in the app, and why enrichment never ran.
    */
-  enrichShopMenu: (
-    shopId: string,
-    force = false,
-  ): Promise<EnrichSummaryResponse> => {
+  enrichShopMenu: (force = false): Promise<EnrichSummaryResponse> => {
     return axiosInstance
-      .post("/ai/menu/enrich-all", { shopId, force })
+      .post("/ai/menu/enrich-all", { force })
       .then((res) => res.data);
   },
 

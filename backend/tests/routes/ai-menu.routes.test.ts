@@ -123,6 +123,89 @@ describe("AI routes — authentication boundary", () => {
   });
 });
 
+describe("AI routes — shop scoping for enrichment", () => {
+  /**
+   * A real shop owned by a real user, plus the token they would present.
+   *
+   * Signed rather than mocked because the thing under test is precisely which
+   * shop id the handler ends up using, and the token is one of the two places
+   * it can come from.
+   */
+  async function seedOwnerWithShop() {
+    const jwt = (await import("jsonwebtoken")).default;
+    const mongoose = (await import("mongoose")).default;
+    const { Shops } = await import("../../models/Shop");
+
+    const userId = new mongoose.Types.ObjectId();
+    const shop = await Shops.create({
+      name: `Scoping Test Bistro ${userId.toString()}`,
+      type: "restaurant",
+      address: { country: "Egypt", city: "Cairo", street: "1 Test St" },
+      phoneNumber: "+201000000000",
+      email: "scoping.test@example.com",
+      ownerId: userId,
+    });
+
+    const token = jwt.sign(
+      {
+        userId: userId.toString(),
+        email: "scoping.test@example.com",
+        role: "shop_owner",
+        shopId: shop._id.toString(),
+      },
+      process.env.JWT_SECRET as string,
+      { expiresIn: "10m" },
+    );
+
+    return { token, shopId: shop._id.toString() };
+  }
+
+  it("derives the shop from the token when the body omits it", async () => {
+    const app = await buildApp();
+    const { token, shopId } = await seedOwnerWithShop();
+    enrichShopMenuMock.mockResolvedValue({
+      processed: 0,
+      failed: 0,
+      skipped: 0,
+      errors: [],
+    });
+
+    const res = await request(app)
+      .post("/api/v1/ai/menu/enrich-all")
+      .set("Authorization", `Bearer ${token}`)
+      .send({});
+
+    // The dashboard has no shop id in context, which is why this call had no
+    // caller anywhere in the app and enrichment never ran. Requiring it in the
+    // body is what made the feature unreachable.
+    expect(res.status).toBe(200);
+    expect(enrichShopMenuMock).toHaveBeenCalledWith(shopId, { force: false });
+  });
+
+  it("scopes single-item enrichment to the caller's own shop", async () => {
+    const app = await buildApp();
+    const { token, shopId } = await seedOwnerWithShop();
+    enrichMenuItemMock.mockResolvedValue({
+      ingredients: [],
+      allergens: [],
+      dietaryTags: [],
+    });
+
+    await request(app)
+      .post("/api/v1/ai/menu/enrich/507f1f77bcf86cd799439011")
+      .set("Authorization", `Bearer ${token}`)
+      .send({});
+
+    // `isShopMember` cannot enforce this — the path has no :shopId, so it
+    // checks the caller against their own shop and passes. The scope has to
+    // travel to the service or any member can enrich any item in the database.
+    expect(enrichMenuItemMock).toHaveBeenCalledWith(
+      "507f1f77bcf86cd799439011",
+      { shopId },
+    );
+  });
+});
+
 describe("AI routes — rate limiting", () => {
   it("cuts off the public search endpoint once the window limit is hit", async () => {
     const app = await buildApp();

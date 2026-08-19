@@ -33,6 +33,24 @@ function ensureAiEnabled() {
 }
 
 /**
+ * The shop these enrichment writes belong to.
+ *
+ * Resolved exactly the way `isShopMember` resolves it, and deliberately in
+ * that order — the middleware validated whichever of the two it landed on, so
+ * reading a different one here would mean writing to a shop nobody checked.
+ */
+function resolveCallerShopId(req: Parameters<RequestHandler>[0]): string {
+  const shopId = req.body?.shopId || req.user?.shopId;
+  if (!shopId) {
+    throw new Errors.BadRequestError({
+      ar: "معرف المتجر مطلوب",
+      en: "shopId is required",
+    });
+  }
+  return String(shopId);
+}
+
+/**
  * POST /api/v1/ai/menu/vision-extract
  * Multipart upload field: `files`. Staff/admin only.
  */
@@ -128,7 +146,14 @@ export const enrichItemHandler: RequestHandler = async (req, res, next) => {
   try {
     ensureAiEnabled();
 
-    const result = await enrichMenuItem(req.params.itemId);
+    // Scoped to the caller's own shop. `isShopMember` cannot do this for us:
+    // the path carries `:itemId`, not `:shopId`, so it falls back to the
+    // caller's shop from the token and confirms they belong to it — true, and
+    // irrelevant to which item they just asked us to enrich. See
+    // services/ai/menu-enrich.service.ts.
+    const shopId = resolveCallerShopId(req);
+
+    const result = await enrichMenuItem(req.params.itemId, { shopId });
 
     res.status(200).json({ message: "Menu item enriched", data: result });
   } catch (error) {
@@ -144,13 +169,13 @@ export const enrichShopHandler: RequestHandler = async (req, res, next) => {
   try {
     ensureAiEnabled();
 
-    const { shopId, force } = req.body ?? {};
-    if (!shopId) {
-      throw new Errors.BadRequestError({
-        ar: "معرف المتجر مطلوب",
-        en: "shopId is required",
-      });
-    }
+    // shopId is optional in the body: a shop owner or staff member enriching
+    // their own menu has it on their token already, and requiring it in the
+    // body meant the dashboard had to source a value it never held. An admin
+    // acting on another shop still passes it explicitly, and `isShopMember`
+    // resolves it the same way before this runs.
+    const shopId = resolveCallerShopId(req);
+    const { force } = req.body ?? {};
 
     const summary = await enrichShopMenu(shopId, { force: Boolean(force) });
     logger.info({ shopId, summary }, "Shop menu enrichment finished");

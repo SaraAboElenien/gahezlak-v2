@@ -1,4 +1,4 @@
-import { getClaudeClient, AI_CONFIG } from "../../config/claude";
+import { getClaudeClient, AI_CONFIG, outputConfig } from "../../config/claude";
 import { AIMenuDataModel } from "../../models/AIMenuData";
 import { MenuItemModel, IMenuItem } from "../../models/MenuItem";
 import { logger } from "../../config/pino";
@@ -92,6 +92,19 @@ const SYSTEM_PROMPT = [
   "normally prepared, include it. Only omit an allergen when the dish would not",
   "normally contain it at all.",
   "",
+  "Judge the whole plate, not only the words you are given. A menu description",
+  "lists what is *in* a dish, rarely what it is served in or on, and the carrier",
+  "is usually where the allergen is. Infer it from the dish name:",
+  "- sandwich, wrap, roll, burger, toastie, pita, shawarma → bread: wheat, gluten",
+  "- pasta, noodles, pastry, dumpling, batter, breadcrumbs → wheat, gluten",
+  "- anything battered, crumbed or breaded, including fried items → wheat, gluten",
+  "- creamy, cheesy or buttery sauces → dairy, milk. Mayonnaise → eggs.",
+  "- tahini, halva, and most Middle Eastern dips → sesame",
+  "- pesto, dukkah, romesco, satay and nut-based sauces, dressings or garnishes",
+  "  → tree nuts or peanuts, even when the nut itself is not named",
+  "Missing an allergen is the failure with real consequences; listing one that",
+  "turns out to be avoidable only costs the customer a menu option.",
+  "",
   "Only apply a dietary tag when the dish clearly qualifies. Do not tag a dish",
   "'vegan' or 'gluten-free' on the assumption that a substitution could be made.",
   "Return an empty array rather than guessing when the name and description give",
@@ -106,11 +119,16 @@ function describeItem(item: IMenuItem): string {
 
 /** Runs one Claude call for a single item. Throws on failure. */
 async function analyseItem(item: IMenuItem): Promise<EnrichmentResult> {
+  // ENRICH_MODEL, not MODEL: this is the one path where being wrong has
+  // consequences past a bad search result, so it can be pinned to a stronger
+  // model without paying that rate on every visitor search. Defaults to MODEL.
+  const model = AI_CONFIG.ENRICH_MODEL;
+
   const response = await getClaudeClient().messages.create({
-    model: AI_CONFIG.MODEL,
+    model,
     max_tokens: AI_CONFIG.MAX_TOKENS,
     system: SYSTEM_PROMPT,
-    output_config: { format: { type: "json_schema", schema: ENRICH_SCHEMA } },
+    output_config: outputConfig(ENRICH_SCHEMA, model),
     messages: [{ role: "user", content: describeItem(item) }],
   });
 
@@ -129,11 +147,30 @@ async function analyseItem(item: IMenuItem): Promise<EnrichmentResult> {
  *
  * Upsert rather than insert so re-running after a menu edit refreshes the row
  * instead of failing on the unique `menuItemId` index.
+ *
+ * `options.shopId` scopes the lookup, and the caller is expected to pass it.
+ * Without it this reached any item id in the database: the route is
+ * `POST /enrich/:itemId`, so `isShopMember` finds no `shopId` in the params
+ * and falls back to the caller's *own* shop from the token — which it then
+ * validates successfully, because it is their shop. The membership check
+ * passes and says nothing at all about the item being enriched. Any logged-in
+ * shop member could therefore spend this account's API credits writing
+ * `ai_menu_data` rows for a competitor's menu.
  */
 export async function enrichMenuItem(
   menuItemId: string | Types.ObjectId,
+  options: { shopId?: string | Types.ObjectId } = {},
 ): Promise<EnrichmentResult> {
-  const item = await MenuItemModel.findById(menuItemId);
+  // A malformed id would make findOne throw a CastError; treat it as "no such
+  // item in your shop", which is also what it looks like to the caller.
+  if (!Types.ObjectId.isValid(menuItemId)) {
+    throw new Error(`Menu item ${String(menuItemId)} not found`);
+  }
+
+  const item = await MenuItemModel.findOne({
+    _id: menuItemId,
+    ...(options.shopId ? { shopId: options.shopId } : {}),
+  });
   if (!item) {
     throw new Error(`Menu item ${String(menuItemId)} not found`);
   }
@@ -201,7 +238,7 @@ export async function enrichShopMenu(
       // `.toString()` rather than the raw _id: MenuItem types its id as
       // mongodb's ObjectId while this signature takes mongoose's, and the two
       // are structurally different despite being the same value at runtime.
-      await enrichMenuItem(item._id.toString());
+      await enrichMenuItem(item._id.toString(), { shopId });
       summary.processed++;
     } catch (err) {
       summary.failed++;

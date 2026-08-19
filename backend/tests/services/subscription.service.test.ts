@@ -40,12 +40,13 @@ import { assertShopHasActiveSubscription } from "../../middlewares/subscription-
  * a paid month away. Nothing downstream re-derives it, so this number is the
  * decision.
  *
- * The second is `status`. `assertShopHasActiveSubscription` admits only ACTIVE
- * and TRIALING, so every status written here is an access-control decision as
- * well as a billing one. In particular nothing in this file may ever write
- * TRIALING or ACTIVE: those are the webhook's to write, once Paymob has
- * confirmed a real transaction. Writing them earlier would hand a free trial
- * to anyone who merely opened a checkout page.
+ * The second is `status`. Entitlement is decided by `isEntitledToService`
+ * (models/Subscription.ts) — ACTIVE, TRIALING, or CANCELLED while
+ * `currentPeriodEnd` is still in the future — so every status written here is
+ * an access-control decision as well as a billing one. In particular nothing
+ * in this file may ever write TRIALING or ACTIVE: those are the webhook's to
+ * write, once Paymob has confirmed a real transaction. Writing them earlier
+ * would hand a free trial to anyone who merely opened a checkout page.
  *
  * Deliberately NOT mocked: Mongo. Several of the behaviours that matter most
  * (the shop-scoped upsert, what an `undefined` in `$set` actually does) are
@@ -143,6 +144,10 @@ async function seedListableSubscription(
     shopName?: string;
     planTitle?: string;
     createdAt?: Date;
+    // Needed since the cancellation grace period became part of "active":
+    // for a CANCELLED row, whether it is still inside its paid period is the
+    // whole question.
+    currentPeriodEnd?: Date;
   } = {},
 ) {
   const n = nextSeq();
@@ -170,6 +175,12 @@ async function seedListableSubscription(
     plan: plan._id,
     status: opts.status ?? SubscriptionStatus.ACTIVE,
     createdAt: opts.createdAt,
+    // Spread only when set: `currentPeriodEnd: undefined` would override
+    // seedSubscription's default rather than fall through to it, and the
+    // field is required.
+    ...(opts.currentPeriodEnd
+      ? { currentPeriodEnd: opts.currentPeriodEnd }
+      : {}),
   });
 
   return { subscription, user, shop, plan };
@@ -659,22 +670,22 @@ describe("cancelSubscription", () => {
   });
 
   /**
-   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed. Do not
-   * "fix" this by changing the assertions.
+   * The lockout, fixed 2026-08-19. These assertions used to be inverted and
+   * carried a "do not fix by changing the assertions" note, because the
+   * behaviour was reported rather than resolved.
    *
-   * Cancelling keeps `currentPeriodEnd` deliberately: the webhook's cancel
-   * handler says in as many words that the shop "can use service until period
-   * ends". It cannot. `assertShopHasActiveSubscription` admits only ACTIVE and
-   * TRIALING, so access dies the instant CANCELLED is written — while
-   * `createOrUpdatePendingSubscription` still treats that same row as a live
-   * subscription until `currentPeriodEnd` passes.
+   * Cancelling keeps `currentPeriodEnd` deliberately — the webhook's cancel
+   * handler says the shop "can use service until period ends", and the
+   * `SubscriptionStatus` enum says CANCELLED means "will expire at period
+   * end". The gate disagreed and admitted only ACTIVE/TRIALING, so access died
+   * the instant CANCELLED was written, while `createOrUpdatePendingSubscription`
+   * still treated that same row as live and refused to sell a replacement. A
+   * shop cancelling one day into a paid month spent the rest of it unable to
+   * take a single order *and* unable to re-subscribe, money already taken.
    *
-   * A shop that cancels one day into a paid month therefore spends the rest of
-   * the month unable to take a single order *and* unable to re-subscribe, with
-   * the money already taken. Two reasonable behaviours (cancel-at-period-end
-   * billing, status-only gating) compose into one that nobody chose.
+   * All three call sites now share `isEntitledToService`.
    */
-  it("keeps the paid period but revokes access immediately", async () => {
+  it("keeps both the paid period and access to it", async () => {
     const { cancelSubscription } = await subscriptionService();
     const periodEnd = new Date(Date.now() + 25 * DAY);
     await seedSubscription({
@@ -686,9 +697,54 @@ describe("cancelSubscription", () => {
     await cancelSubscription(USER_A.toString());
 
     const stored = await Subscriptions.findOne({ shop: SHOP_A }).lean();
+    expect(stored?.status).toBe(SubscriptionStatus.CANCELLED);
     expect(stored?.currentPeriodEnd.getTime()).toBe(periodEnd.getTime());
-    // Paid up for 25 more days, and locked out for all of them.
-    await expect(assertShopHasActiveSubscription(SHOP_A)).rejects.toThrow();
+    // Paid up for 25 more days, and able to trade for all of them.
+    await expect(
+      assertShopHasActiveSubscription(SHOP_A),
+    ).resolves.toBeUndefined();
+  });
+
+  it("stops access once the cancelled period actually runs out", async () => {
+    // The other half. A gate that admitted every CANCELLED row would pass the
+    // test above and give away service indefinitely.
+    await seedSubscription({
+      status: SubscriptionStatus.CANCELLED,
+      currentPeriodEnd: new Date(Date.now() - DAY),
+      cancelledAt: new Date(Date.now() - 30 * DAY),
+    });
+
+    await expect(assertShopHasActiveSubscription(SHOP_A)).rejects.toThrow(
+      errMsg.NO_ACTIVE_SUBSCRIPTION.en,
+    );
+  });
+
+  it("leaves a cancelled-but-paid shop able to trade and unable to double-pay", async () => {
+    // The composed bug, walked end to end: these two rules are individually
+    // reasonable and used to combine into "cannot use it, cannot replace it".
+    const { cancelSubscription, createOrUpdatePendingSubscription } =
+      await subscriptionService();
+    const plan = await seedPlan();
+    await seedSubscription({
+      status: SubscriptionStatus.ACTIVE,
+      currentPeriodEnd: new Date(Date.now() + 25 * DAY),
+      paymobSubscriptionId: 900007,
+    });
+
+    await cancelSubscription(USER_A.toString());
+
+    await expect(
+      assertShopHasActiveSubscription(SHOP_A),
+    ).resolves.toBeUndefined();
+    // Still refused a second plan — they have already paid for this window,
+    // and charging again for it is the failure in the other direction.
+    await expect(
+      createOrUpdatePendingSubscription({
+        shopId: SHOP_A.toString(),
+        userId: USER_A.toString(),
+        plan,
+      }),
+    ).rejects.toThrow(errMsg.USER_ALREADY_SUBSCRIBED.en);
   });
 });
 
@@ -705,42 +761,63 @@ describe("getUserActiveSubscription", () => {
     },
   );
 
-  it.each([SubscriptionStatus.CANCELLED, SubscriptionStatus.EXPIRED])(
-    "returns nothing for a subscription that is %s",
-    async (status) => {
-      const { getUserActiveSubscription } = await subscriptionService();
-      const { user } = await seedListableSubscription({ status });
-
-      await expect(
-        getUserActiveSubscription(user._id.toString()),
-      ).resolves.toBeNull();
-    },
-  );
-
-  /**
-   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed.
-   *
-   * PENDING means "we have written a row and sent the owner to Paymob's
-   * checkout page", nothing more; `assertShopHasActiveSubscription` rejects it,
-   * correctly. This query admits it anyway, so a shop that opened the checkout
-   * page and closed it is told by its own dashboard that it has a subscription,
-   * while every gated action goes on failing. The two answers should come from
-   * the same predicate.
-   */
-  it("also reports an unpaid pending subscription as the user's active one", async () => {
+  it("returns nothing for an expired subscription", async () => {
     const { getUserActiveSubscription } = await subscriptionService();
+    const { user } = await seedListableSubscription({
+      status: SubscriptionStatus.EXPIRED,
+    });
+
+    await expect(
+      getUserActiveSubscription(user._id.toString()),
+    ).resolves.toBeNull();
+  });
+
+  it("returns a cancelled subscription that is still inside its paid period", async () => {
+    const { getUserActiveSubscription } = await subscriptionService();
+    const { user } = await seedListableSubscription({
+      status: SubscriptionStatus.CANCELLED,
+      currentPeriodEnd: new Date(Date.now() + 10 * DAY),
+    });
+
+    // Previously null: this query had its own idea of "active" that ignored
+    // the cancellation grace period, so a shop that had cancelled but was
+    // still paid up saw no subscription at all in its dashboard while it went
+    // on legitimately trading.
+    const found = await getUserActiveSubscription(user._id.toString());
+
+    expect(found?.status).toBe(SubscriptionStatus.CANCELLED);
+  });
+
+  it("returns nothing once the cancelled period has run out", async () => {
+    const { getUserActiveSubscription } = await subscriptionService();
+    const { user } = await seedListableSubscription({
+      status: SubscriptionStatus.CANCELLED,
+      currentPeriodEnd: new Date(Date.now() - DAY),
+    });
+
+    await expect(
+      getUserActiveSubscription(user._id.toString()),
+    ).resolves.toBeNull();
+  });
+
+  it("agrees with the access gate about an unpaid pending subscription", async () => {
+    const { getUserActiveSubscription } = await subscriptionService();
+    const { shop } = await seedListableSubscription({
+      status: SubscriptionStatus.PENDING,
+    });
     const { user } = await seedListableSubscription({
       status: SubscriptionStatus.PENDING,
     });
 
-    const found = await getUserActiveSubscription(user._id.toString());
-
-    expect(found?.status).toBe(SubscriptionStatus.PENDING);
+    // PENDING means "we wrote a row and sent the owner to Paymob's checkout
+    // page", nothing more. This query used to admit it while the gate rejected
+    // it, so a shop that opened checkout and closed it was told by its own
+    // dashboard that it had a subscription while every gated action failed.
+    // Both answers now come from one predicate.
     await expect(
-      assertShopHasActiveSubscription(
-        (found!.shop as { _id: Types.ObjectId })._id,
-      ),
-    ).rejects.toThrow();
+      getUserActiveSubscription(user._id.toString()),
+    ).resolves.toBeNull();
+    await expect(assertShopHasActiveSubscription(shop._id)).rejects.toThrow();
   });
 
   it("populates the plan and shop the dashboard renders, without Paymob's internals", async () => {

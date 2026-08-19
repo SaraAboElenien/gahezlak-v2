@@ -33,7 +33,16 @@ const createMock = vi.hoisted(() => vi.fn());
 vi.mock("../../config/claude", () => ({
   getClaudeClient: () => ({ messages: { create: createMock } }),
   aiEnabled: () => true,
-  AI_CONFIG: { MODEL: "claude-opus-5", MAX_TOKENS: 8000 },
+  AI_CONFIG: {
+    MODEL: "claude-opus-5",
+    ENRICH_MODEL: "claude-opus-5",
+    MAX_TOKENS: 8000,
+    EFFORT: "low",
+  },
+  outputConfig: (schema: unknown) => ({
+    effort: "low",
+    format: { type: "json_schema", schema },
+  }),
 }));
 
 /** Shapes a fake Claude reply carrying structured search criteria. */
@@ -238,5 +247,86 @@ describe("searchMenu — degradation when the model is unavailable", () => {
     await expect(
       searchMenu({ query: "chicken (spicy) *", shopId }),
     ).resolves.toBeDefined();
+  });
+});
+
+describe("dropRedundantDietaryTags", () => {
+  /**
+   * A guard against the model mirroring an avoidance into the matching tag.
+   *
+   * Enrichment lists allergens exhaustively but applies tags conservatively,
+   * so requiring `gluten-free` *and* excluding `gluten` matches almost nothing
+   * while the exclusion alone works fine. The system prompt asks for this and
+   * English queries comply — but a real Arabic query ("شيء نباتي بدون جلوتين",
+   * "something vegetarian without gluten") came back with both and returned 0
+   * of 30 items. This app is bilingual, so prompt compliance in one language
+   * is not coverage.
+   */
+  it("drops a dietary tag that only restates an excluded allergen", async () => {
+    const { dropRedundantDietaryTags } =
+      await import("../../services/ai/menu-search.service");
+
+    const out = dropRedundantDietaryTags({
+      keywords: [],
+      avoidAllergens: ["gluten"],
+      requireDietaryTags: ["vegetarian", "gluten-free"],
+    });
+
+    expect(out.requireDietaryTags).toEqual(["vegetarian"]);
+    // The allergen exclusion has to survive — it is what does the filtering.
+    expect(out.avoidAllergens).toEqual(["gluten"]);
+  });
+
+  it("matches an allergen synonym, not just the exact word", async () => {
+    const { dropRedundantDietaryTags } =
+      await import("../../services/ai/menu-search.service");
+
+    // "wheat" and "gluten" are separate enum values that mean the same thing
+    // to a customer avoiding bread, and the model uses them interchangeably.
+    expect(
+      dropRedundantDietaryTags({
+        keywords: [],
+        avoidAllergens: ["wheat"],
+        requireDietaryTags: ["gluten-free"],
+      }).requireDietaryTags,
+    ).toEqual([]);
+
+    expect(
+      dropRedundantDietaryTags({
+        keywords: [],
+        avoidAllergens: ["milk"],
+        requireDietaryTags: ["dairy-free"],
+      }).requireDietaryTags,
+    ).toEqual([]);
+  });
+
+  it("keeps a genuine diet request untouched", async () => {
+    const { dropRedundantDietaryTags } =
+      await import("../../services/ai/menu-search.service");
+
+    // The other direction. A guard that stripped every tag would pass the
+    // tests above on its own and quietly break every "I'm vegan" search.
+    const out = dropRedundantDietaryTags({
+      keywords: [],
+      avoidAllergens: ["shellfish"],
+      requireDietaryTags: ["vegan", "keto"],
+    });
+
+    expect(out.requireDietaryTags).toEqual(["vegan", "keto"]);
+  });
+
+  it("keeps a -free tag when the matching allergen is not excluded", async () => {
+    const { dropRedundantDietaryTags } =
+      await import("../../services/ai/menu-search.service");
+
+    // "I want something labelled gluten-free" is a legitimate request on its
+    // own; only the *pair* is redundant.
+    expect(
+      dropRedundantDietaryTags({
+        keywords: [],
+        avoidAllergens: [],
+        requireDietaryTags: ["gluten-free"],
+      }).requireDietaryTags,
+    ).toEqual(["gluten-free"]);
   });
 });

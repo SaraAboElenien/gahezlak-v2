@@ -5,6 +5,7 @@ import { Grid3X3, List, ChefHat, Package, Upload } from "lucide-react";
 import MenuSection from "@/components/menu-management/MenuSection";
 import { useTranslation } from "react-i18next";
 import MenuUploadSection from "@/components/menu-management/MenuUploadSection";
+import MenuEnrichSection from "@/components/menu-management/MenuEnrichSection";
 import toast from "react-hot-toast";
 import { AI_ENABLED } from "@/config/features";
 
@@ -169,7 +170,14 @@ const Menu: React.FC = () => {
         {/* Tab Content */}
         <div className="transition-all duration-300">
           {activeTab === "categories" && <CategoriesSection />}
-          {activeTab === "items" && <MenuSection />}
+          {activeTab === "items" && (
+            <>
+              {/* Sits above the item list, on the tab where items are added
+                  and edited — that is when a menu's analysis goes stale. */}
+              {AI_ENABLED && <MenuEnrichSection />}
+              <MenuSection />
+            </>
+          )}
           {AI_ENABLED && activeTab === "upload" && (
             <MenuUploadSection onComplete={handleCompleteUploadingMenu} />
           )}

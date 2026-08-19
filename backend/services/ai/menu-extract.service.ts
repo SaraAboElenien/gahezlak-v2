@@ -1,7 +1,7 @@
 import { Buffer } from "buffer";
 import Anthropic from "@anthropic-ai/sdk";
 import sharp from "sharp";
-import { getClaudeClient, AI_CONFIG } from "../../config/claude";
+import { getClaudeClient, AI_CONFIG, outputConfig } from "../../config/claude";
 import { logger } from "../../config/pino";
 
 /**
@@ -132,7 +132,7 @@ async function extractFromImage(
   const response = await getClaudeClient().messages.create({
     model: AI_CONFIG.MODEL,
     max_tokens: AI_CONFIG.MAX_TOKENS,
-    output_config: { format: { type: "json_schema", schema: MENU_SCHEMA } },
+    output_config: outputConfig(MENU_SCHEMA),
     messages: [
       {
         role: "user",

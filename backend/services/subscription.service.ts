@@ -2,6 +2,7 @@ import {
   ISubscription,
   SubscriptionStatus,
   Subscriptions,
+  entitledToServiceFilter,
 } from "../models/Subscription";
 import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
@@ -33,20 +34,13 @@ export async function createOrUpdatePendingSubscription({
   userId: string;
   plan: IPlan;
 }) {
-  // 1. Check for a currently valid subscription (active, trialing, or cancelled-in-grace-period)
+  // 1. Refuse to sell a second plan to a shop that is still entitled to the
+  // one it has. Same rule as the access gate — they used to be separate
+  // encodings that disagreed, which is what let a cancelled-but-paid-up shop
+  // be simultaneously denied service and denied the chance to re-subscribe.
   const existingValidSub = await Subscriptions.findOne({
     shop: shopId,
-    $or: [
-      {
-        status: {
-          $in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING],
-        },
-      },
-      {
-        status: SubscriptionStatus.CANCELLED,
-        currentPeriodEnd: { $gt: new Date() },
-      },
-    ],
+    ...entitledToServiceFilter(),
   });
 
   if (existingValidSub) {
@@ -133,19 +127,24 @@ export async function cancelSubscription(userId: string) {
   return subscription.toObject();
 }
 
-// Get user's active subscription
+/**
+ * The user's subscription, if it currently entitles them to service.
+ *
+ * This was the third place that answered "is this subscription active" with a
+ * different rule: it admitted PENDING (not yet paid for) and ignored the
+ * cancellation grace period entirely, so it disagreed with both the access
+ * gate and the re-subscribe guard. It now shares their definition.
+ *
+ * Changing it is safe: it has no callers outside tests. That is also why it
+ * was worth fixing rather than leaving — the next person to wire it into a
+ * dashboard would have inherited a fourth answer.
+ */
 export async function getUserActiveSubscription(
   userId: string,
 ): Promise<ISubscription | null> {
   const subscription = await Subscriptions.findOne({
     userId,
-    status: {
-      $in: [
-        SubscriptionStatus.ACTIVE,
-        SubscriptionStatus.TRIALING,
-        SubscriptionStatus.PENDING,
-      ],
-    },
+    ...entitledToServiceFilter(),
   })
     .populate(
       "plan",

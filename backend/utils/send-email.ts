@@ -20,7 +20,7 @@ import { logger } from "../config/pino";
  */
 let cachedTransporter: Transporter | null = null;
 
-const getTransporter = (): { transporter: Transporter; user: string } => {
+const getTransporter = (): { transporter: Transporter; from: string } => {
   // Read at call time, not module load, so the check reflects the environment
   // as it actually is when mail is sent.
   const user = process.env.sendEmail;
@@ -30,14 +30,39 @@ const getTransporter = (): { transporter: Transporter; user: string } => {
     throw new Error("Email credentials are not set in environment variables.");
   }
 
+  const host = process.env.SMTP_HOST?.trim();
+
+  /**
+   * The address recipients see, which is **not** always the SMTP username.
+   *
+   * On Gmail they are the same address, which is why this used to interpolate
+   * the username directly. On a transactional provider they are usually
+   * different — Brevo logs in as something like `xxxxx@smtp-brevo.com` but
+   * requires the From to be a sender you have verified, and rejects the
+   * message outright otherwise. Defaults to the username so existing Gmail
+   * configuration behaves exactly as before.
+   */
+  const from = process.env.EMAIL_FROM?.trim() || user;
+
   if (!cachedTransporter) {
-    cachedTransporter = createTransport({
-      service: "gmail",
-      auth: { user, pass },
-    });
+    cachedTransporter = createTransport(
+      host
+        ? {
+            host,
+            port: Number(process.env.SMTP_PORT) || 587,
+            // 465 is implicit TLS; 587 is STARTTLS, which nodemailer upgrades
+            // to on its own. Deriving this from the port avoids a third
+            // variable that is wrong in exactly one combination.
+            secure: (Number(process.env.SMTP_PORT) || 587) === 465,
+            auth: { user, pass },
+          }
+        : // No SMTP_HOST: keep the original Gmail behaviour, so nothing
+          // changes for a deployment that has not opted in.
+          { service: "gmail", auth: { user, pass } },
+    );
   }
 
-  return { transporter: cachedTransporter, user };
+  return { transporter: cachedTransporter, from };
 };
 
 export const sendEmail = async (
@@ -46,7 +71,7 @@ export const sendEmail = async (
   html: string,
   attachments: Attachment[] = [],
 ): Promise<boolean> => {
-  const { transporter, user } = getTransporter();
+  const { transporter, from } = getTransporter();
 
   const wrappedHtml = `
     <div style="font-family: Arial, sans-serif; background: #f9f9f9; padding: 30px;">
@@ -64,7 +89,7 @@ export const sendEmail = async (
   `;
 
   const mailOptions: SendMailOptions = {
-    from: `"Gahezlak 👻" <${user}>`,
+    from: `"Gahezlak" <${from}>`,
     to,
     subject,
     html: wrappedHtml,
@@ -78,11 +103,12 @@ export const sendEmail = async (
       info.accepted && Array.isArray(info.accepted) && info.accepted.length > 0
     );
   } catch (error) {
-    if (error instanceof Error) {
-      logger.error(error.name);
-    } else {
-      logger.error("Unknown error occurred in sendEmail");
-    }
+    // The full error, not just `error.name` — which logged the literal
+    // string "Error" and told you nothing. This is the only signal that mail
+    // is failing: three of the four callers ignore the boolean below, so a
+    // blocked SMTP relay otherwise looks like a successful signup with no
+    // email ever arriving.
+    logger.error({ err: error, to, subject }, "sendEmail failed");
     return false;
   }
 };

@@ -180,6 +180,25 @@ services:
       - key: emailPassword
         sync: false
 
+      # Optional. Unset = Gmail, exactly as before. Set SMTP_HOST to use a
+      # transactional provider instead — strongly recommended on Render, where
+      # Gmail SMTP is routinely blocked from the platform's IP ranges and the
+      # failure is near-invisible (sendEmail returns false and most callers
+      # ignore it, so signup "succeeds" and no email arrives).
+      #
+      # Brevo:  SMTP_HOST=smtp-relay.brevo.com, SMTP_PORT=587,
+      #         sendEmail=<Brevo login>, emailPassword=<Brevo SMTP key>,
+      #         EMAIL_FROM=<a sender verified in Brevo>.
+      #
+      # EMAIL_FROM is needed whenever the SMTP login is not itself a usable
+      # sender address; it defaults to the login, which is right for Gmail.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+
       # --- Image hosting -------------------------------------------------
       # Required in practice for ANY shop creation, not just logo uploads:
       # createShopHandler unconditionally generates and uploads a QR code, so

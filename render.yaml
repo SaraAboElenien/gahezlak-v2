@@ -119,7 +119,17 @@ services:
     rootDir: backend
     # `npm ci` (not install) so the lockfile is authoritative. `npm run build`
     # is `tsc`, which emits to backend/dist/.
-    buildCommand: npm ci && npm run build
+    #
+    # `--include=dev` is load-bearing and must not be dropped. This service sets
+    # NODE_ENV=production (correctly — it gates cookie Secure/SameSite and the
+    # CORS localhost allowances), and npm omits devDependencies whenever
+    # NODE_ENV is production. `typescript` and every `@types/*` package are
+    # devDependencies, so without this flag the build fails with a wall of
+    # TS7016 "could not find a declaration file for module 'express'" and
+    # TS7006 implicit-any errors. Verified by reproduction on 2026-08-19:
+    # `NODE_ENV=production npm ci` installs neither typescript nor @types/*;
+    # adding `--include=dev` installs both.
+    buildCommand: npm ci --include=dev && npm run build
     # `npm start` is `node --env-file-if-exists=.env dist/server.js`. There is
     # no .env file in a Render container — the flag is the "if-exists" variant
     # precisely so it is a no-op here and Render's own environment is used.
@@ -325,7 +335,12 @@ services:
     # Vite inlines import.meta.env.VITE_* into the bundle at build time. Render
     # exposes the service's env vars to the build, so declaring it below covers
     # both — but it does mean changing it requires a rebuild, not a restart.
-    buildCommand: npm ci && npm run build
+    # `--include=dev` for the same reason as the API service above, defensively:
+    # this service deliberately does NOT set NODE_ENV (see the note at the
+    # bottom of this block), so devDependencies install today regardless. The
+    # flag means that if anyone ever adds NODE_ENV=production here, the build
+    # keeps working instead of failing on a missing `tsc`.
+    buildCommand: npm ci --include=dev && npm run build
     # `npm start` is `tsx server/index.ts`. tsx and express are runtime
     # dependencies (not devDependencies) precisely so this works after a
     # production install.

@@ -15,6 +15,24 @@ const REQUIRED_ENV_VARS = [
   "FRONTEND_URL",
 ] as const;
 
+// Not required — but a deployment missing these cannot verify a single new
+// account, so it must not be silent either.
+//
+// This warning carries a load-bearing responsibility. sendEmail() used to
+// THROW when these were absent, deliberately, on the reasoning that a
+// deployment mistake should be loud rather than silent. That reasoning was
+// right; the mechanism was not. Throwing happened *mid-request*, after
+// signUp had already written the user row — so the caller got a 500 while a
+// half-activated account existed that they could neither verify nor
+// re-register. sendEmail now honours its Promise<boolean> signature and never
+// throws, and the loudness moved here: once, at boot, where an operator can
+// act on it and no user is halfway through anything.
+//
+// Deliberately a warning rather than a fatal error: local development without
+// SMTP credentials must still boot, matching how every other optional
+// integration in this codebase degrades (see the note above).
+const EMAIL_ENV_VARS = ["sendEmail", "emailPassword"] as const;
+
 export function validateEnv(): void {
   const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
 
@@ -22,6 +40,19 @@ export function validateEnv(): void {
     throw new Error(
       `Missing required environment variable(s): ${missing.join(", ")}. ` +
         "Set them in your .env file (or the deployment environment) before starting the server.",
+    );
+  }
+
+  const missingEmail = EMAIL_ENV_VARS.filter((name) => !process.env[name]);
+
+  if (missingEmail.length > 0) {
+    // console.warn rather than the pino logger: this module runs before
+    // anything else is imported (see the note at the bottom of this file), and
+    // importing the logger here would give it a side effect to execute first.
+    console.warn(
+      `[env] Email is not configured (missing: ${missingEmail.join(", ")}). ` +
+        "Signup, resend-verification and password-reset will create codes that " +
+        "are never delivered. Set them to enable outbound mail.",
     );
   }
 }

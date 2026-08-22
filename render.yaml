@@ -377,6 +377,27 @@ services:
       - key: VITE_AI_ENABLED
         sync: false
 
+      # Cold-start pre-warm. Nothing needs setting here — it defaults to ON
+      # whenever RENDER is present in the environment, which Render injects into
+      # every service. Listed so it is discoverable, and so it can be switched
+      # off from the dashboard without a code change.
+      #
+      # What it does: on boot, and on a throttled basis when a /shops/:slug page
+      # is requested, the frontend server fires a fire-and-forget GET at the
+      # API's /health. Both free-tier services sleep independently, so without
+      # this a visitor wakes the frontend (~50s) and only then discovers the API
+      # is also asleep (~50s more). Warming them together roughly halves it.
+      #
+      # This is NOT an uptime pinger and must not be turned into one: 750 free
+      # instance-hours per workspace per month against two always-on services
+      # (~1,460h) would suspend both. Every warm here is demand-driven, throttled
+      # to one per 5 minutes, and never fires for a route that would not have
+      # called the API anyway. See frontend/server/lib/warm-api.ts.
+      #
+      # Runtime value, so flipping it needs only a restart, not a rebuild.
+      - key: WARM_API
+        sync: false
+
       # Optional frontend Sentry DSN. Baked into the bundle at build time
       # (VITE_ prefix), so changing it needs a rebuild. Full DSN URL, not the
       # bare public key. Inert when blank.

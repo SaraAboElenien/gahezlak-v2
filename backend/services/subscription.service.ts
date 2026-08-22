@@ -9,6 +9,7 @@ import { errMsg } from "../common/err-messages";
 import { IPlan } from "../models/Plan";
 import { cancelPaymobSubscription } from "../utils/paymob";
 import mongoose, { FilterQuery, PipelineStage } from "mongoose";
+import { escapeRegex } from "../utils/escape-regex";
 
 /**
  * Casts a caller-supplied id for use in an aggregation `$match`, rejecting a
@@ -215,12 +216,17 @@ export async function getAllSubscriptions(filters: {
     { $unwind: "$plan" },
   ];
   if (search) {
+    // Escaped — see utils/escape-regex.ts. This one runs inside an aggregation
+    // $match, so the pattern is evaluated after three $lookups have already
+    // built the working set: a pathological pattern costs more here than on a
+    // plain find().
+    const safeSearch = escapeRegex(search);
     aggregatePipeline.push({
       $match: {
         $or: [
-          { "user.email": { $regex: search, $options: "i" } },
-          { "shop.name": { $regex: search, $options: "i" } },
-          { "plan.title": { $regex: search, $options: "i" } },
+          { "user.email": { $regex: safeSearch, $options: "i" } },
+          { "shop.name": { $regex: safeSearch, $options: "i" } },
+          { "plan.title": { $regex: safeSearch, $options: "i" } },
         ],
       },
     });

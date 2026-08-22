@@ -11,6 +11,7 @@ import {
   ACCESS_TOKEN_TTL_SECONDS,
   REFRESH_TOKEN_TTL_SECONDS,
 } from "../config/cookies";
+import { logger } from "../config/pino";
 
 // Fields that must never leave the server in an API response.
 const SENSITIVE_USER_FIELDS = [
@@ -163,13 +164,34 @@ export async function signUp(userData: {
   // anyway (schema paths live on the prototype, not as own properties).
   await Users.create(newUser);
 
-  // Send verification email only after successful user creation in a separate thread
-
-  await sendEmail(
+  // Send the verification email only after the user row exists.
+  //
+  // `.catch(console.error)` used to hang off this call and was dead code:
+  // sendEmail catches its own errors and resolves `false`, so the promise
+  // cannot reject and the handler never ran. The boolean is what carries the
+  // failure, and ignoring it is why a blocked SMTP relay looked exactly like a
+  // successful signup.
+  //
+  // The account is deliberately NOT rolled back when mail fails. The user is
+  // recoverable — `resendVerificationCode` issues a fresh code — whereas
+  // deleting the row would lose their password and force them to notice a
+  // failure they were never told about. What is still missing is telling *them*
+  // rather than only the log; that changes the signup response shape, so it is
+  // a product decision tracked in TECH_DEBT.md rather than something to slip in
+  // here.
+  const verificationEmailSent = await sendEmail(
     email,
     "Your Verification Code",
     `Your verification code is: <b>${code}</b>. It will expire in 10 minutes.`,
-  ).catch(console.error);
+  );
+
+  if (!verificationEmailSent) {
+    logger.error(
+      { email, reason },
+      "Signup succeeded but the verification email failed to send. The account " +
+        "exists and cannot be activated until the user requests a new code.",
+    );
+  }
 }
 
 /**
@@ -264,17 +286,31 @@ export async function resendVerificationCode(userData: { email: string }) {
     $set: { verificationCode },
   });
 
-  // Deliberately awaited rather than fire-and-forget: a user whose mail
-  // genuinely fails to send should be told, rather than being left waiting for
-  // a code that was never dispatched. The residual signal this leaves — a
-  // broken mail transport would fail for real addresses while unknown ones
-  // still return 200 — needs SMTP to be down to say anything, and is not
-  // something an attacker can provoke per-address.
-  await sendEmail(
+  // Awaited rather than fire-and-forget so the send is finished before the
+  // response is written, but the result deliberately does NOT change what the
+  // caller sees.
+  //
+  // An earlier version of this comment claimed the user "should be told" when
+  // mail fails. That was never what the code did — the boolean was discarded —
+  // and it must not become what it does: this endpoint returns one generic
+  // response for registered, unregistered and already-verified addresses
+  // precisely so it cannot be used to enumerate accounts. Branching the
+  // response on delivery success would reintroduce that oracle, since mail only
+  // gets sent for addresses that exist.
+  //
+  // So the failure goes to the operator, not the caller.
+  const resendEmailSent = await sendEmail(
     user.email,
     "Your New Verification Code",
     `Your new verification code is: <b>${verificationCode.code}</b>. It will expire in 10 minutes.`,
   );
+
+  if (!resendEmailSent) {
+    logger.error(
+      { email: user.email },
+      "resendVerificationCode issued a new code but the email failed to send",
+    );
+  }
 
   return genericResponse;
 }
@@ -335,11 +371,21 @@ export async function forgotPassword(userData: { email: string }) {
     $set: { verificationCode },
   });
 
-  await sendEmail(
+  // Same enumeration constraint as resendVerificationCode above: the response
+  // is generic whether or not the address exists, so delivery failure is
+  // reported to the log rather than to the caller.
+  const resetEmailSent = await sendEmail(
     user.email,
     "Your Password Reset Code",
     `Your password reset code is: <b>${verificationCode.code}</b>. It will expire in 10 minutes.`,
   );
+
+  if (!resetEmailSent) {
+    logger.error(
+      { email: user.email },
+      "forgotPassword issued a reset code but the email failed to send",
+    );
+  }
 
   return genericResponse;
 }

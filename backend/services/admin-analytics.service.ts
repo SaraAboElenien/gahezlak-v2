@@ -1,6 +1,42 @@
-import { FilterQuery } from "mongoose";
+import { FilterQuery, PipelineStage } from "mongoose";
 import { ISubscription, Subscriptions } from "../models/Subscription";
 import { Orders } from "../models/Order";
+import { Errors } from "../errors";
+
+/**
+ * Turns the two raw query-string dates these endpoints receive into a window,
+ * or into nothing at all when the caller did not ask for one.
+ *
+ * `routes/admin.routes.ts` mounts all three analytics endpoints with **no
+ * validator**, so both arguments are unvalidated user input and may be absent.
+ * Both failure modes are worth naming, because neither announces itself:
+ *
+ * - Absent: `new Date(undefined)` is an Invalid Date. Inside an aggregation
+ *   `$match` that matches *nothing* — no error, just a permanently empty
+ *   report. That is exactly how the top-restaurants ranking came to be blank
+ *   for every caller that omitted the range.
+ * - Unparseable: a `find()` surfaces it as a Mongoose CastError (a 500 naming
+ *   an internal schema path), while an aggregation swallows it into the same
+ *   silent-empty result. A 400 is the honest answer to both.
+ */
+function parseDateWindow(
+  startDate: string,
+  endDate: string,
+): { start: Date; end: Date } | null {
+  if (!startDate || !endDate) return null;
+
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw new Errors.BadRequestError({
+      en: "startDate and endDate must be valid dates",
+      ar: "يجب أن يكون تاريخ البداية وتاريخ النهاية تاريخين صالحين",
+    });
+  }
+
+  return { start, end };
+}
 
 // Total Revenue from Subscriptions
 export async function getTotalPlatformRevenue(
@@ -9,9 +45,10 @@ export async function getTotalPlatformRevenue(
 ) {
   const query: FilterQuery<ISubscription> = { status: "active" };
 
-  if (startDate && endDate) {
-    query.currentPeriodStart = { $gte: new Date(startDate) };
-    query.currentPeriodEnd = { $lte: new Date(endDate) };
+  const dateWindow = parseDateWindow(startDate, endDate);
+  if (dateWindow) {
+    query.currentPeriodStart = { $gte: dateWindow.start };
+    query.currentPeriodEnd = { $lte: dateWindow.end };
   }
 
   const subscriptions = await Subscriptions.find(query).populate("plan");
@@ -49,13 +86,15 @@ export async function getTopPerformingRestaurants(
   startDate: string,
   endDate: string,
 ) {
+  const dateWindow = parseDateWindow(startDate, endDate);
+
+  const match: PipelineStage.Match["$match"] = { orderStatus: "Delivered" };
+  if (dateWindow) {
+    match.createdAt = { $gte: dateWindow.start, $lte: dateWindow.end };
+  }
+
   const topShops = await Orders.aggregate([
-    {
-      $match: {
-        orderStatus: "Delivered",
-        createdAt: { $gte: new Date(startDate), $lte: new Date(endDate) },
-      },
-    },
+    { $match: match },
     {
       $group: {
         _id: "$shopId",

@@ -92,6 +92,7 @@ const nextShopName = () => `Test Bistro ${++shopNameSeq}`;
 
 let staffRoleId: Types.ObjectId;
 let managerRoleId: Types.ObjectId;
+let adminRoleId: Types.ObjectId;
 
 function shopInput(overrides: Record<string, unknown> = {}) {
   return {
@@ -186,12 +187,16 @@ beforeEach(async () => {
     qrCodeUrl: "https://i.ibb.co/qr.png",
     menuUrl: "http://localhost:5173/shops/Test%20Bistro/menu",
   });
-  const [staff, manager] = await Roles.create([
+  const [staff, manager, admin] = await Roles.create([
     { name: Role.SHOP_STAFF, permissions: [] },
     { name: Role.SHOP_MANAGER, permissions: [] },
+    // Seeded so the escalation tests below can attempt the thing that used to
+    // work. Nothing else in this file assigns it.
+    { name: Role.ADMIN, permissions: [] },
   ]);
   staffRoleId = staff._id;
   managerRoleId = manager._id;
+  adminRoleId = admin._id;
 });
 
 describe("createShop", () => {
@@ -728,6 +733,35 @@ describe("registerShopMember", () => {
     expect(stored?.members[0].userId.toString()).toBe(created!._id.toString());
   });
 
+  /**
+   * PRIVILEGE ESCALATION REGRESSION.
+   *
+   * `getAllRoles` hides admin/shop_owner/user from the dropdown a shop owner
+   * picks from, and for a long time that was the *only* statement of the rule.
+   * This service checked that `roleId` resolved to a real role and nothing
+   * more, while `shop.validator.ts` validates it with `isMongoId()` alone — so
+   * a shop owner who sent the admin role's `_id` directly got what this
+   * function always creates: an account with `isVerified: true` and a password
+   * they chose. A ready-to-use platform administrator, from a staff form.
+   *
+   * The account must not exist afterwards either — a guard that rejects the
+   * response but leaves the user behind would be no guard at all.
+   */
+  it("refuses to create a member holding a non-assignable role", async () => {
+    const { registerShopMember } = await shopService();
+    const shop = await seedShop();
+
+    await expect(
+      registerShopMember(shop._id.toString(), memberData(adminRoleId)),
+    ).rejects.toThrow("That role cannot be assigned to a shop member");
+
+    await expect(
+      Users.countDocuments({ email: "new.member@example.com" }),
+    ).resolves.toBe(0);
+    const stored = await Shops.findById(shop._id).lean();
+    expect(stored?.members).toHaveLength(0);
+  });
+
   it("returns no credentials or internal fields to the caller", async () => {
     const { registerShopMember } = await shopService();
     const shop = await seedShop();
@@ -913,6 +947,42 @@ describe("updateMemberRole", () => {
 
     const stored = await Shops.findById(shop._id).lean();
     expect(stored?.members[0].roleId.toString()).toBe(managerRoleId.toString());
+  });
+
+  /**
+   * PRIVILEGE ESCALATION REGRESSION — the promotion half.
+   *
+   * Same hole as the one guarded in `registerShopMember`, reached from the
+   * other direction: rather than creating an admin outright, promote an
+   * existing member into one. This is the more dangerous variant to leave open
+   * once the create path is closed, because `updateMemberRole` now writes
+   * `Users.role` too — the field `isAllowed` actually reads — so a successful
+   * call here grants the permissions immediately rather than only relabelling.
+   *
+   * Both writes must be refused, which is why the user document is asserted as
+   * well as the roster.
+   */
+  it("refuses to promote a member into a non-assignable role", async () => {
+    const { updateMemberRole } = await shopService();
+    const staff = await seedUser(staffRoleId);
+    const shop = await seedShop({
+      members: [{ userId: oid(staff._id), roleId: staffRoleId }],
+    });
+
+    await expect(
+      updateMemberRole(
+        shop._id.toString(),
+        staff._id.toString(),
+        adminRoleId.toString(),
+      ),
+    ).rejects.toThrow("That role cannot be assigned to a shop member");
+
+    const storedShop = await Shops.findById(shop._id).lean();
+    expect(storedShop?.members[0].roleId.toString()).toBe(
+      staffRoleId.toString(),
+    );
+    const storedUser = await Users.findById(staff._id).lean();
+    expect(storedUser?.role?.toString()).toBe(staffRoleId.toString());
   });
 
   it("moves the member's permissions, not just the roster label", async () => {

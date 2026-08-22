@@ -3,6 +3,7 @@ import { MenuItemModel, IMenuItem } from "../../models/MenuItem";
 import { AIMenuDataModel } from "../../models/AIMenuData";
 import { logger } from "../../config/pino";
 import { Types } from "mongoose";
+import { escapeRegex } from "../../utils/escape-regex";
 
 /**
  * Natural-language menu search with allergy and dietary awareness.
@@ -217,9 +218,11 @@ export async function searchMenu({
 
   if (criteria.keywords.length > 0) {
     // Escaped: keywords come from a customer-supplied query, and an unescaped
-    // "(" or "*" would either throw or turn into an unintended pattern.
+    // "(" or "*" would either throw or turn into an unintended pattern. This
+    // was the only escaped $regex site in the codebase; the shared helper it
+    // now uses was extracted from here and applied to the four that weren't.
     const patterns = criteria.keywords.map(
-      (k) => new RegExp(k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"),
+      (k) => new RegExp(escapeRegex(k), "i"),
     );
     filter.$or = [
       { "name.en": { $in: patterns } },

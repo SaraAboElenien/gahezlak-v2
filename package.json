@@ -2,7 +2,7 @@
   "name": "gahezlak-monorepo",
   "private": true,
   "version": "0.0.0",
-  "description": "Repo-root tooling only (formatting + git hooks). NOT an npm workspace root: backend/ and frontend/ stay fully independent packages with their own node_modules and lockfiles.",
+  "description": "Repo-root tooling only (formatting, git hooks, end-to-end tests). NOT an npm workspace root: backend/ and frontend/ stay fully independent packages with their own node_modules and lockfiles. The root devDependencies below exist only because the E2E suite spans BOTH packages and so cannot live inside either one.",
   "scripts": {
     "prepare": "husky",
     "format": "prettier --write .",
@@ -10,7 +10,12 @@
     "lint:backend": "npm --prefix backend run lint",
     "lint:frontend": "npm --prefix frontend run lint",
     "test:backend": "npm --prefix backend test",
-    "test:frontend": "npm --prefix frontend test"
+    "test:frontend": "npm --prefix frontend test",
+    "e2e:install": "playwright install --with-deps chromium",
+    "e2e:build": "node e2e/harness/build-frontend.mjs",
+    "test:e2e": "npm run e2e:build && playwright test",
+    "test:e2e:ui": "npm run e2e:build && playwright test --ui",
+    "test:e2e:report": "playwright show-report e2e/.artifacts/report"
   },
   "lint-staged": {
     "*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,json,jsonc,css,scss,html,yml,yaml,md}": [
@@ -18,8 +23,11 @@
     ]
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
-    "prettier": "^3.6.2"
+    "mongodb-memory-server": "^11.2.0",
+    "prettier": "^3.6.2",
+    "tsx": "^4.23.5"
   }
 }

@@ -28,6 +28,7 @@ import getLocalizedText from "@/utils/getLocalizedText";
 import toast from "react-hot-toast";
 import { AI_ENABLED } from "@/config/features";
 import AiAllergyNotice from "@/components/menu/AiAllergyNotice";
+import PageLoading from "@/components/PageLoading";
 
 const RestaurantMenu: React.FC = () => {
   const { addToCart } = useCart();
@@ -151,15 +152,16 @@ const RestaurantMenu: React.FC = () => {
     setCollapsedCategories(newCollapsed);
   };
 
-  // Loading state
+  // Loading state. PageLoading is the ordinary spinner until an API request
+  // has been outstanding long enough to be a Render free-tier cold start, at
+  // which point it explains the wait instead of leaving a QR-scanning customer
+  // staring at a spinner for ~50 seconds.
   if (isMenuLoading || isCategoriesLoading) {
     return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
-          <p className="text-gray-600">{t("publicMenu.loadingMenu")}</p>
-        </div>
-      </div>
+      <PageLoading
+        className="min-h-screen"
+        label={t("publicMenu.loadingMenu")}
+      />
     );
   }
 

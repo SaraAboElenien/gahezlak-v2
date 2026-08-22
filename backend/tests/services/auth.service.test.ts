@@ -234,19 +234,20 @@ describe("signUp", () => {
   });
 
   it("still creates the account when the verification email fails to send", async () => {
-    const consoleError = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
-    sendEmailMock.mockRejectedValue(new Error("SMTP down"));
+    // `false`, not a rejection: sendEmail's signature is Promise<boolean> and
+    // it catches its own errors. An earlier version of this test mocked a
+    // rejection, which meant it was asserting against behaviour the real
+    // function does not have — and it kept passing only because the caller
+    // carried a `.catch(console.error)` that could never fire.
+    sendEmailMock.mockResolvedValue(false);
 
     await expect(register()).resolves.toBeUndefined();
 
-    // Deliberate: the send is fire-and-forget (`.catch(console.error)`), so a
-    // mail outage must not roll back a valid registration. The user recovers
-    // via resend-verification-code.
+    // Deliberate: a mail outage must not roll back a valid registration. The
+    // account is recoverable via resend-verification-code, whereas deleting the
+    // row would discard the user's password over a transient relay failure.
     const user = await storedUser();
     expect(user.verificationCode.code).toHaveLength(6);
-    consoleError.mockRestore();
   });
 });
 

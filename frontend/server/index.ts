@@ -32,14 +32,39 @@ if (!apiBase) {
   process.exit(1);
 }
 
+/**
+ * Cold-start pre-warm (see `lib/warm-api.ts`).
+ *
+ * Defaults to on wherever Render is the host — `RENDER` is one of the env vars
+ * Render injects into every service — and off everywhere else, so `npm start`
+ * on a laptop never reaches out to a deployed backend. `WARM_API=true|false`
+ * overrides in either direction without a code change, which is what makes it
+ * switchable from the dashboard if the free-tier arithmetic ever changes.
+ */
+function envFlag(value: string | undefined, fallback: boolean): boolean {
+  const normalised = (value ?? "").trim().toLowerCase();
+  if (!normalised) return fallback;
+  return normalised === "1" || normalised === "true" || normalised === "yes";
+}
+
+const warmApiEnabled = envFlag(
+  process.env.WARM_API,
+  Boolean(process.env.RENDER),
+);
+
 const app = createApp({
   apiBase,
   siteUrl: process.env.SITE_URL?.trim(),
   distDir: path.resolve(__dirname, "../dist"),
+  warmApi: { enabled: warmApiEnabled },
 });
 
 // Bind 0.0.0.0: Render routes traffic in from outside the container, so a
 // loopback-only bind fails the health check with no obvious cause.
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Frontend server listening on port ${PORT}`);
+  console.log(
+    `Frontend server listening on port ${PORT} (API pre-warm ${
+      warmApiEnabled ? "enabled" : "disabled"
+    })`,
+  );
 });

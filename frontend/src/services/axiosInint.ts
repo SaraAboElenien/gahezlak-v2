@@ -1,5 +1,6 @@
 import axios from "axios";
 import { BASE_URL } from "@/config/api";
+import { beginApiRequest } from "./apiActivity";
 
 const REFRESH_ENDPOINT = "/auth/refresh";
 
@@ -30,9 +31,34 @@ export const clearAccessToken = (): void => {
   accessToken = null;
 };
 
+/**
+ * Request-duration tracking for the cold-start wake-up notice (see
+ * `apiActivity.ts`). Keyed off the request config object by WeakMap rather
+ * than a property on it, so nothing about the request that goes over the wire
+ * changes and there is nothing to clean up if a request is abandoned.
+ */
+const activityTrackers = new WeakMap<object, () => void>();
+
+function startTracking(config: object): void {
+  // The 401 path re-issues the *same* config object through this interceptor.
+  // Without ending the previous attempt first, that request would stay counted
+  // as in-flight forever and the notice would never disappear.
+  activityTrackers.get(config)?.();
+  activityTrackers.set(config, beginApiRequest());
+}
+
+function stopTracking(config: object | undefined): void {
+  if (!config) return;
+  const end = activityTrackers.get(config);
+  if (!end) return;
+  activityTrackers.delete(config);
+  end();
+}
+
 // Attach access token to every request
 axiosInstance.interceptors.request.use(
   (config) => {
+    startTracking(config);
     if (accessToken) {
       config.headers.Authorization = `Bearer ${accessToken}`;
     }
@@ -54,6 +80,10 @@ let refreshPromise: Promise<string | null> | null = null;
 export const refreshAccessToken = (): Promise<string | null> => {
   if (!refreshPromise) {
     refreshPromise = (async () => {
+      // Tracked by hand because this is a bare axios call, on purpose (see
+      // above). It is also usually the *first* request a returning visitor
+      // makes, so it is the one that discovers a sleeping backend.
+      const endTracking = beginApiRequest();
       try {
         // No body: the refresh token travels as the httpOnly cookie, which
         // only rides along because of `withCredentials`.
@@ -69,6 +99,8 @@ export const refreshAccessToken = (): Promise<string | null> => {
         // No valid session left (missing/expired/already-rotated cookie).
         clearAccessToken();
         return null;
+      } finally {
+        endTracking();
       }
     })().finally(() => {
       refreshPromise = null;
@@ -80,9 +112,16 @@ export const refreshAccessToken = (): Promise<string | null> => {
 
 // Handle 401 errors and refresh token
 axiosInstance.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    stopTracking(response.config);
+    return response;
+  },
   async (error) => {
     const originalRequest = error.config;
+
+    // Ended before anything else: the retry below re-enters the request
+    // interceptor and starts a fresh measurement of its own.
+    stopTracking(originalRequest);
 
     // The refresh token is an httpOnly cookie now, so there is nothing to
     // check up front — we just attempt the refresh and treat a failure as

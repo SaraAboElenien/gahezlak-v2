@@ -73,9 +73,23 @@ export const menuItemSchema = z.object({
   categoryId: z
     .string()
     .regex(/^[0-9a-fA-F]{24}$/, "Please select a valid category"),
+  // An image is OPTIONAL, and the empty string is the shape that was missing.
+  //
+  // The backend's `imgUrl` is optional, `ItemCard` renders a "No image"
+  // placeholder, and `seed-menu.ts` seeds 41 dishes with no image on purpose —
+  // so "no photo" is a supported state everywhere except here. `MenuItemForm`
+  // resets `image` to `""`, which satisfied neither branch (`.optional()`
+  // permits only `undefined`), so the form rejected itself with "Image is
+  // required" and **no dish could be created from the dashboard at all**.
+  // Editing a dish that had no image failed identically.
+  //
+  // Three legal shapes: "" (nothing chosen), a URL (an existing item's imgUrl,
+  // round-tripped unchanged) and a FileList (a newly attached file).
+  // `ItemModal` already handles all three on submit.
   image: z
     .union([
-      z.string().min(1, "Image is required").url("Invalid Image format"),
+      z.literal(""),
+      z.string().url("Invalid Image format"),
       z
         .instanceof(FileList)
         .refine(

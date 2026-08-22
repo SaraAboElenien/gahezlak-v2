@@ -62,3 +62,20 @@ postman*
 eslint-errors.txt
 coverage/
 .vercel/
+
+# End-to-end test output and the cached mongod binary.
+#
+# Both are large and regenerable, and both sit at paths that are otherwise
+# perfectly ordinary source directories, so neither is caught by the rules
+# above. `.cache/mongodb-binaries` holds a ~77 MB mongod executable, shared by
+# the local backend run (backend/vitest.config.mts), the E2E harness
+# (playwright.config.ts) and CI, which caches it by that same path.
+# `e2e/.artifacts` holds the HTML report plus a screenshot and a video for
+# every failed test — megabytes per run.
+#
+# This repo has already paid for a large binary reaching a commit once: four
+# JPEGs put 27 MB into the tree and the push failed with an HTTP 408 that
+# looked like a network fault. Committed blobs stay in history whether or not
+# a later commit removes them.
+.cache/
+e2e/.artifacts/

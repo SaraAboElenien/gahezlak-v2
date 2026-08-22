@@ -169,7 +169,7 @@ export const getPublicShopListHandler: RequestHandler<
 export const regenerateQRCodeHandler: RequestHandler<
   Empty,
   SuccessResponse<{ qrCodeUrl: string; menuUrl: string }>,
-  { options?: QRCodeOptions }
+  Pick<QRCodeOptions, "width" | "margin" | "errorCorrectionLevel">
 > = async (req, res) => {
   const { userId } = requireUser(req);
   const user = await Users.findById(userId);
@@ -177,9 +177,23 @@ export const regenerateQRCodeHandler: RequestHandler<
     throw new Errors.NotFoundError(errMsg.USER_HAS_NO_SHOP);
   }
 
+  // `validateRegenerateQRCode` bounds these at the TOP level of the body
+  // (width 100-1000, margin 0-10, errorCorrectionLevel L/M/Q/H). This handler
+  // used to read `req.body.options` instead, which meant the two never met:
+  // a validated `{ width }` was silently discarded, while an unvalidated
+  // `{ options: { width: 100000 } }` skipped the bounds entirely and reached
+  // QRCode.toBuffer, allocating a 100000x100000 bitmap on an authenticated
+  // request. Reading the validated fields is what closes both halves.
+  const { width, margin, errorCorrectionLevel } = req.body;
+  const options: QRCodeOptions = {};
+  if (width !== undefined) options.width = width;
+  if (margin !== undefined) options.margin = margin;
+  if (errorCorrectionLevel !== undefined)
+    options.errorCorrectionLevel = errorCorrectionLevel;
+
   const result = await ShopService.regenerateShopQRCode(
     user.shop.toString(),
-    req.body.options,
+    options,
   );
 
   res.status(200).json({

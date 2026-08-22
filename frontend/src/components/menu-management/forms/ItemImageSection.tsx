@@ -22,6 +22,11 @@ const ItemImageSection: React.FC<ItemImageSectionProps> = ({
 }) => {
   const { t } = useTranslation();
   const [previewImage, setPreviewImage] = useState<string | null>(null);
+
+  // Captured rather than spread inline, so `handleImageChange` can run *in
+  // addition to* react-hook-form's own change handler instead of replacing it.
+  // See the input below.
+  const imageRegistration = register("image");
   useEffect(() => {
     if (imgUrl) {
       setPreviewImage(imgUrl);
@@ -44,16 +49,27 @@ const ItemImageSection: React.FC<ItemImageSectionProps> = ({
     [],
   );
 
-  const removeImage = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setPreviewImage(null);
+  const removeImage = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setPreviewImage(null);
 
-    const fileInput = document.getElementById("item-image") as HTMLInputElement;
-    if (fileInput) {
+      const fileInput = document.getElementById(
+        "item-image",
+      ) as HTMLInputElement | null;
+      if (!fileInput) return;
       fileInput.value = "";
-    }
-  }, []);
+      // Clearing `.value` empties the DOM input but tells react-hook-form
+      // nothing, so the removed FileList would still have been submitted.
+      // Handing it the now-empty input is what actually drops the file.
+      void imageRegistration.onChange({
+        target: fileInput,
+        type: "change",
+      });
+    },
+    [imageRegistration],
+  );
 
   return (
     <div>
@@ -103,11 +119,22 @@ const ItemImageSection: React.FC<ItemImageSectionProps> = ({
               )}
               <div className="w-full">
                 <input
-                  id="image"
+                  // Was `id="image"`, while BOTH surrounding labels point at
+                  // "item-image" — so neither label was associated with the
+                  // control, and `removeImage`'s getElementById found nothing.
+                  id="item-image"
                   type="file"
                   disabled={isLoading}
-                  {...register("image")}
-                  onChange={handleImageChange}
+                  {...imageRegistration}
+                  // Both handlers, in this order. Declaring `onChange` after
+                  // spreading the registration used to OVERWRITE the one
+                  // react-hook-form puts there, so RHF never saw the FileList
+                  // and `image` stayed `""` no matter what the user attached —
+                  // half of why no dish could be created from the dashboard.
+                  onChange={(event) => {
+                    void imageRegistration.onChange(event);
+                    handleImageChange(event);
+                  }}
                   accept="image/*"
                   className="input input-bordered absolute top-0 left-0 h-full w-full opacity-0 cursor-pointer z-0
                  "

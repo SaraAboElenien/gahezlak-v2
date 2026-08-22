@@ -63,6 +63,7 @@ enum errorMessage {
   INVALID_ROLE_ID = "INVALID_ROLE_ID",
   CANNOT_REMOVE_OWNER = "CANNOT_REMOVE_OWNER",
   CANNOT_UPDATE_OWNER_ROLE = "CANNOT_UPDATE_OWNER_ROLE",
+  ROLE_NOT_ASSIGNABLE = "ROLE_NOT_ASSIGNABLE",
   NOT_ALLOWED_ACTION = "NOT_ALLOWED_ACTION",
   USER_ALREADY_HAS_SHOP = "USER_ALREADY_HAS_SHOP",
   INVALID_HMAC_SIGNATURE = "INVALID_HMAC_SIGNATURE",
@@ -315,6 +316,10 @@ export const errMsg: {
   CANNOT_UPDATE_OWNER_ROLE: {
     en: "Cannot update owner role",
     ar: "لا يمكن تحديث دور المالك",
+  },
+  ROLE_NOT_ASSIGNABLE: {
+    en: "That role cannot be assigned to a shop member",
+    ar: "لا يمكن إسناد هذا الدور إلى أحد أعضاء المتجر",
   },
   NOT_ALLOWED_ACTION: {
     en: "This action is not allowed",

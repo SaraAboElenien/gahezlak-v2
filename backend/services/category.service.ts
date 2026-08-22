@@ -29,6 +29,42 @@ export async function createCategory(
   return category.toObject();
 }
 
+/**
+ * Fields a category update is permitted to touch — mirrors
+ * `updateCategoryValidator`.
+ *
+ * The allowlist is the security control. `shopId` is an ICategory field that
+ * the validator does not name, and express-validator does not strip unlisted
+ * keys, so spreading `req.body` into the update let a shop manager move a
+ * category onto a shop they do not own: the `{ _id, shopId }` filter matched
+ * using their own shop, then wrote someone else's id into the document. The
+ * heading disappeared from their own menu and appeared on the other shop's
+ * public menu — where its new "owner" could not remove it, because every
+ * category route is addressed by their own `shopId`. Same class as the
+ * menu-item and shop-ownership holes fixed on 2026-08-05, and proven by
+ * `tests/services/category.service.test.ts`.
+ */
+const UPDATABLE_CATEGORY_FIELDS = [
+  "name",
+  "description",
+] as const satisfies readonly (keyof ICategory)[];
+
+function pickUpdatableCategoryFields(
+  updateData: Partial<ICategory>,
+): Partial<ICategory> {
+  const updates: Partial<ICategory> = {};
+  for (const field of UPDATABLE_CATEGORY_FIELDS) {
+    const value = updateData[field];
+    if (value !== undefined) {
+      // TypeScript cannot correlate the key with its value type while `field`
+      // ranges over a union of keys, so it widens the target to `never`. The
+      // assignment is sound — the same `field` indexes both objects.
+      (updates as Record<string, unknown>)[field] = value;
+    }
+  }
+  return updates;
+}
+
 export async function updateCategory(
   shopId: string,
   categoryId: string,
@@ -53,7 +89,7 @@ export async function updateCategory(
       _id: new mongoose.Types.ObjectId(categoryId),
       shopId,
     },
-    updateData,
+    pickUpdatableCategoryFields(updateData),
     { new: true },
   ).lean();
 

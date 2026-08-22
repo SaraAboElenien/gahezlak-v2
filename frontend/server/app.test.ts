@@ -242,6 +242,135 @@ describe("static assets and headers", () => {
   });
 });
 
+describe("API cold-start pre-warm", () => {
+  /** Mirrors `jsonResponse` but for the shop lookup the SPA handler makes. */
+  function shopResponse() {
+    return jsonResponse({ data: { name: "Test Bistro" } });
+  }
+
+  it("is off unless explicitly enabled", async () => {
+    const warmFetch = vi.fn(async () => shopResponse());
+    vi.stubGlobal("fetch", warmFetch);
+
+    // No `warmApi` in config at all — the default the tests and local dev use.
+    await request(app()).get("/shops/test-bistro");
+
+    // The SEO lookup happens as always; nothing is aimed at /health.
+    expect(warmFetch).toHaveBeenCalled();
+    expect(warmFetch).not.toHaveBeenCalledWith(
+      "https://api.example.test/health",
+      expect.anything(),
+    );
+  });
+
+  it("pings the API health endpoint as the server boots", async () => {
+    const warmFetch = vi.fn(async () => jsonResponse({ status: "ok" }));
+
+    createApp({
+      apiBase: API_BASE,
+      distDir,
+      warmApi: {
+        enabled: true,
+        fetchImpl: warmFetch as unknown as typeof fetch,
+        log: () => {},
+      },
+    });
+
+    // The point of the whole exercise: this happens while the frontend process
+    // is still starting, so the API's ~50s wake overlaps ours instead of
+    // queueing behind it.
+    expect(warmFetch).toHaveBeenCalledWith(
+      "https://api.example.test/health",
+      expect.anything(),
+    );
+  });
+
+  it("warms again for a shop page, throttled", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => shopResponse()),
+    );
+    const warmFetch = vi.fn(async () => jsonResponse({ status: "ok" }));
+    let clock = 1_000_000;
+
+    const warmed = createApp({
+      apiBase: API_BASE,
+      distDir,
+      warmApi: {
+        enabled: true,
+        throttleMs: 60_000,
+        fetchImpl: warmFetch as unknown as typeof fetch,
+        now: () => clock,
+        log: () => {},
+      },
+    });
+    expect(warmFetch).toHaveBeenCalledTimes(1); // boot
+
+    // This server can stay awake serving static assets while the API sleeps on
+    // its own clock, so a shop request is a second chance to wake it early.
+    clock += 60_001;
+    await request(warmed).get("/shops/test-bistro");
+    expect(warmFetch).toHaveBeenCalledTimes(2);
+
+    // Within the window, further requests must cost nothing — burning the free
+    // instance-hour allowance is the failure mode this guards against.
+    await request(warmed).get("/shops/test-bistro");
+    await request(warmed).get("/shops/test-bistro/menu");
+    expect(warmFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not warm on non-shop routes", async () => {
+    const warmFetch = vi.fn(async () => jsonResponse({ status: "ok" }));
+    let clock = 1_000_000;
+
+    const warmed = createApp({
+      apiBase: API_BASE,
+      distDir,
+      warmApi: {
+        enabled: true,
+        throttleMs: 60_000,
+        fetchImpl: warmFetch as unknown as typeof fetch,
+        now: () => clock,
+        log: () => {},
+      },
+    });
+    warmFetch.mockClear(); // drop the boot ping
+
+    clock += 60_001;
+    await request(warmed).get("/login");
+    await request(warmed).get("/healthz");
+    await request(warmed).get("/assets/index-abc123.js");
+
+    expect(warmFetch).not.toHaveBeenCalled();
+  });
+
+  it("serves the page normally when the warm-up fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => shopResponse()),
+    );
+
+    const warmed = createApp({
+      apiBase: API_BASE,
+      distDir,
+      warmApi: {
+        enabled: true,
+        throttleMs: 0,
+        fetchImpl: (async () => {
+          throw new Error("ECONNREFUSED");
+        }) as unknown as typeof fetch,
+        log: () => {},
+      },
+    });
+
+    const res = await request(warmed).get("/shops/test-bistro");
+
+    // A failed warm-up must be completely invisible to the visitor.
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("Test Bistro");
+  });
+});
+
 describe("Open Graph image absolutisation", () => {
   it("serves an absolute og:image on plain SPA routes", async () => {
     const res = await request(app()).get("/login");

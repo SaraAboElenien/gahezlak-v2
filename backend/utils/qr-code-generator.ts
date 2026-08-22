@@ -1,5 +1,7 @@
 import QRCode from "qrcode";
 import uploadToImgbb from "./upload-to-imgbb";
+import { Errors } from "../errors";
+import { logger } from "../config/pino";
 
 export interface QRCodeOptions {
   width?: number;
@@ -24,8 +26,15 @@ export async function generateAndUploadMenuQRCode(
   options: QRCodeOptions = {},
 ): Promise<{ qrCodeUrl: string; menuUrl: string }> {
   try {
-    // Construct the menu URL
-    const menuUrl = `${baseUrl}/shops/${shopName}/menu`;
+    // Construct the menu URL.
+    //
+    // encodeURIComponent is not cosmetic here. Shop names are free text, and
+    // this string is burned permanently into a printed QR code — a name
+    // containing "#" or "?" silently truncates the path at scan time ("Joe's
+    // Diner #2" becomes /shops/Joe's Diner ), so the diner lands on a 404 and
+    // nothing server-side ever observes the failure. Encoding is transparent
+    // to the SPA, which decodes route params before matching.
+    const menuUrl = `${baseUrl}/shops/${encodeURIComponent(shopName)}/menu`;
 
     // Default QR code options optimized for menu scanning
     const qrOptions = {
@@ -60,6 +69,17 @@ export async function generateAndUploadMenuQRCode(
       menuUrl,
     };
   } catch (error) {
+    // Do NOT flatten typed errors into a bare Error. This catch used to wrap
+    // everything — including the BadRequestError that uploadToImgbb throws for
+    // a missing/invalid IMGBB_KEY — which stripped the status code and message
+    // the global error handler relies on, so every cause surfaced identically
+    // as a blank 500 "Internal server error". That is exactly how an unset
+    // IMGBB_KEY in production stayed invisible: the endpoint answered 500 while
+    // the same code path succeeded locally, and the response said nothing.
+    if (error instanceof Errors.CustomError) {
+      throw error;
+    }
+    logger.error({ err: error }, "QR code generation failed");
     throw new Error(
       `Failed to generate and upload QR code: ${
         error instanceof Error ? error.message : "Unknown error"

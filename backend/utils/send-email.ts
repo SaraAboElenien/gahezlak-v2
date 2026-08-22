@@ -71,8 +71,6 @@ export const sendEmail = async (
   html: string,
   attachments: Attachment[] = [],
 ): Promise<boolean> => {
-  const { transporter, from } = getTransporter();
-
   const wrappedHtml = `
     <div style="font-family: Arial, sans-serif; background: #f9f9f9; padding: 30px;">
       <div style="max-width: 500px; margin: auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 32px 24px;">
@@ -88,15 +86,26 @@ export const sendEmail = async (
     </div>
   `;
 
-  const mailOptions: SendMailOptions = {
-    from: `"Gahezlak" <${from}>`,
-    to,
-    subject,
-    html: wrappedHtml,
-    attachments,
-  };
-
   try {
+    // Inside the try, deliberately. getTransporter() THROWS when the email
+    // credentials are unset — which is the normal state in local development
+    // and the likely state of a half-configured deploy. Called outside, it made
+    // this function reject despite its `Promise<boolean>` signature, so every
+    // caller that reasonably trusted that signature inherited an exception it
+    // never handled: an unconfigured mail transport turned a valid signup into
+    // a 500 with the user row already written.
+    //
+    // The boolean is the single failure channel. This function does not throw.
+    const { transporter, from } = getTransporter();
+
+    const mailOptions: SendMailOptions = {
+      from: `"Gahezlak" <${from}>`,
+      to,
+      subject,
+      html: wrappedHtml,
+      attachments,
+    };
+
     const info = await transporter.sendMail(mailOptions);
 
     return (
@@ -104,10 +113,12 @@ export const sendEmail = async (
     );
   } catch (error) {
     // The full error, not just `error.name` — which logged the literal
-    // string "Error" and told you nothing. This is the only signal that mail
-    // is failing: three of the four callers ignore the boolean below, so a
-    // blocked SMTP relay otherwise looks like a successful signup with no
-    // email ever arriving.
+    // string "Error" and told you nothing. This log is the operator's signal
+    // that mail is failing. It matters because the three auth callers
+    // deliberately do not change their response when a send fails: two of them
+    // (resend-verification, forgot-password) must stay generic to avoid
+    // becoming account-enumeration oracles, so a blocked relay would otherwise
+    // look exactly like a successful signup with no email ever arriving.
     logger.error({ err: error, to, subject }, "sendEmail failed");
     return false;
   }

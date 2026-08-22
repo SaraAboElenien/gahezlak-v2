@@ -47,10 +47,20 @@ import {
   type PublicShopListItem,
   type SitemapEntry,
 } from "./lib/sitemap";
+import { createApiWarmer, type ApiWarmerOptions } from "./lib/warm-api";
 
 /** Hard ceilings — a slow backend must never hang a page or a crawler. */
 const SHOP_API_TIMEOUT_MS = 2500;
 const SHOP_LIST_TIMEOUT_MS = 4000;
+
+export interface WarmApiConfig extends Omit<ApiWarmerOptions, "apiBase"> {
+  /**
+   * Off unless explicitly switched on. Local dev and the tests must not fire
+   * network requests at a backend just by constructing the app — see
+   * `index.ts` for where the environment turns this on.
+   */
+  enabled: boolean;
+}
 
 export interface ServerConfig {
   /** Backend API base, e.g. https://gahezlak-api.onrender.com/api/v1 */
@@ -59,12 +69,30 @@ export interface ServerConfig {
   siteUrl?: string;
   /** Directory holding the Vite build output. */
   distDir: string;
+  /**
+   * Render free-tier cold-start mitigation. See `lib/warm-api.ts` — the short
+   * version is that the two services sleep independently, so without this a
+   * visitor waits ~50s for this server and then another ~50s for the API.
+   * Omitted or `{ enabled: false }` makes it a complete no-op.
+   */
+  warmApi?: WarmApiConfig;
 }
 
 export function createApp(config: ServerConfig): express.Express {
   const apiBase = config.apiBase.replace(/\/+$/, "");
   const siteUrl = (config.siteUrl ?? "").replace(/\/+$/, "");
   const indexHtmlPath = path.join(config.distDir, "index.html");
+
+  const { enabled: warmApiEnabled = false, ...warmerOptions } =
+    config.warmApi ?? {};
+  const warmer = warmApiEnabled
+    ? createApiWarmer({ apiBase, ...warmerOptions })
+    : null;
+
+  // Deliberately not awaited: this fires while the process is still setting
+  // itself up, so the API's ~50s wake-up overlaps ours instead of following
+  // it. `warm()` swallows every failure, so a dead API costs us nothing here.
+  void warmer?.warm("boot");
 
   const app = express();
 
@@ -226,6 +254,21 @@ export function createApp(config: ServerConfig): express.Express {
       res.setHeader("cache-control", "no-cache");
       return res.status(200).send(html);
     }
+
+    // A shop page is the one route we *know* needs the API a moment later:
+    // React immediately fetches the menu, the categories and the shop. This
+    // server stays awake serving static assets long after the API has gone to
+    // sleep on its own 15-minute clock, so the boot-time warm above is not
+    // enough on its own.
+    //
+    // Cheap by construction: the `fetchShop` call directly below already hits
+    // the API on every one of these requests, so this adds no new *class* of
+    // traffic — only a second call with a cold-start-sized budget instead of a
+    // 2.5s one, at most once per throttle window. Non-shop routes (and every
+    // static asset, which never reaches this handler) are untouched, which is
+    // what keeps crawler traffic from holding the API awake and eating the
+    // free instance-hour allowance.
+    void warmer?.warm(`request ${req.path}`);
 
     // Everything below degrades to the untouched index.html rather than taking
     // a shop's page down: a slow or broken backend must cost us the rich

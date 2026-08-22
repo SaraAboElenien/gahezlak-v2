@@ -11,6 +11,8 @@ import { Roles } from "../models/Role";
 import { hash } from "bcryptjs";
 import { SALT_ROUNDS } from "../config/bcrypt";
 import { collectionsName } from "../common/collections-name";
+import { escapeRegex } from "../utils/escape-regex";
+import { isAssignableMemberRole } from "./role.service";
 
 async function createShop(
   shopData: Pick<
@@ -177,10 +179,15 @@ async function getAllShops({
   const skip = (page - 1) * limit;
   const filter: FilterQuery<IShop> = {};
   if (search) {
+    // Escaped: `search` is caller-supplied and Mongo compiles $regex as a real
+    // pattern on the database server, so an unescaped "(" throws a 500 on a
+    // reasonable search and a backtracking pattern burns mongod CPU for every
+    // tenant at once. See utils/escape-regex.ts.
+    const safeSearch = escapeRegex(search);
     filter.$or = [
-      { name: { $regex: search, $options: "i" } },
-      { email: { $regex: search, $options: "i" } },
-      { phoneNumber: { $regex: search, $options: "i" } },
+      { name: { $regex: safeSearch, $options: "i" } },
+      { email: { $regex: safeSearch, $options: "i" } },
+      { phoneNumber: { $regex: safeSearch, $options: "i" } },
     ];
   }
   const sort: { [key: string]: SortOrder } = {
@@ -289,9 +296,15 @@ async function updateMemberRole(
     throw new Errors.BadRequestError(errMsg.CANNOT_UPDATE_OWNER_ROLE);
   }
 
-  // Check if role exists
+  // Check if role exists AND may be handed out. Existence alone is not
+  // authorisation: `roleId` is validated with `isMongoId()` only, so without
+  // this a shop owner could promote a member straight to platform `admin`.
+  // See NON_ASSIGNABLE_MEMBER_ROLES in role.service.ts.
   const role = await Roles.findById(roleId);
   if (!role) throw new Errors.NotFoundError(errMsg.ROLE_NOT_FOUND);
+  if (!isAssignableMemberRole(role.name)) {
+    throw new Errors.UnauthorizedError(errMsg.ROLE_NOT_ASSIGNABLE);
+  }
 
   const member = shop.members.find((m) => m.userId.toString() === userId);
   if (!member) {
@@ -353,9 +366,16 @@ async function registerShopMember(
   const shop = await Shops.findById(shopId);
   if (!shop) throw new Errors.NotFoundError(errMsg.SHOP_NOT_FOUND);
 
-  // Check if role exists
+  // Check if role exists AND may be handed out — see the note on the same
+  // guard in updateMemberRole above. This is the more dangerous of the two
+  // sites: the account created below is `isVerified: true` with a password
+  // chosen by the caller, so an unguarded admin role here is a ready-to-use
+  // administrator login rather than merely an escalated existing user.
   const role = await Roles.findById(memberData.roleId);
   if (!role) throw new Errors.NotFoundError(errMsg.ROLE_NOT_FOUND);
+  if (!isAssignableMemberRole(role.name)) {
+    throw new Errors.UnauthorizedError(errMsg.ROLE_NOT_ASSIGNABLE);
+  }
 
   // Hash password
   const hashedPassword = await hash(memberData.password, SALT_ROUNDS);

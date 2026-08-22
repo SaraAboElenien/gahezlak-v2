@@ -11,6 +11,7 @@ import {
   refreshAccessToken,
   setAccessToken,
 } from "./axiosInint";
+import { getApiActivitySnapshot, resetApiActivity } from "./apiActivity";
 
 vi.mock("axios", async (importOriginal) => {
   const actual = await importOriginal<typeof import("axios")>();
@@ -29,6 +30,7 @@ const mockedPost = axios.post as unknown as ReturnType<typeof vi.fn>;
 beforeEach(() => {
   clearAccessToken();
   mockedPost.mockReset();
+  resetApiActivity();
 });
 
 describe("access token storage", () => {
@@ -112,6 +114,42 @@ describe("refreshAccessToken", () => {
 
     expect(mockedPost).toHaveBeenCalledTimes(1);
     expect(result).toBe("new-access-token");
+  });
+
+  /**
+   * The silent refresh is a bare axios call, so it bypasses the interceptors
+   * that track everything else — and on a hard reload it is the *first*
+   * request any returning visitor makes, so it is the one that discovers a
+   * sleeping Render service. If it were not tracked by hand, the cold-start
+   * notice would stay invisible for the whole boot.
+   */
+  it("counts as in-flight API activity while it is pending", async () => {
+    let resolvePost: (value: unknown) => void = () => {};
+    mockedPost.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePost = resolve;
+      }),
+    );
+
+    const pending = refreshAccessToken();
+    expect(getApiActivitySnapshot().pending).toBe(1);
+
+    resolvePost({ data: { data: { accessToken: "new-access-token" } } });
+    await pending;
+
+    expect(getApiActivitySnapshot()).toEqual({
+      pending: 0,
+      oldestStartedAt: null,
+    });
+  });
+
+  it("stops counting as in-flight even when the refresh fails", async () => {
+    mockedPost.mockRejectedValue(new Error("network error"));
+
+    await refreshAccessToken();
+
+    // A leaked entry here would leave the wake-up notice on screen forever.
+    expect(getApiActivitySnapshot().pending).toBe(0);
   });
 
   it("starts a fresh request once the previous one has settled", async () => {

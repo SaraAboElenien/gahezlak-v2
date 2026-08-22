@@ -6,6 +6,7 @@ import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
 import bcrypt from "bcryptjs";
 import { SALT_ROUNDS } from "../config/bcrypt";
+import { escapeRegex } from "../utils/escape-regex";
 
 export async function requestEmailChange(userId: string, newEmail: string) {
   const user = await Users.findById(userId);
@@ -59,6 +60,25 @@ export async function confirmEmailChange(userId: string, code: string) {
   }
   if (new Date() > new Date(vCode.expireAt)) {
     throw new Errors.BadRequestError(errMsg.CONFIRMATION_CODE_EXPIRED);
+  }
+
+  // Uniqueness was checked when the change was *requested*, and the request
+  // stays valid for ten minutes — long enough for anyone to sign up with the
+  // same address in the meantime. Without this recheck the collision is only
+  // discovered by the unique index during save(), and escapes as a raw driver
+  // error ("Plan executor error during update :: caused by :: E11000 …")
+  // rather than a domain error: the message leaks a collection and index name,
+  // and the wrapped form is not the shape the global handler's duplicate-key
+  // branch sniffs for, so it lands in the 500 catch-all.
+  //
+  // Deliberately placed *after* the code checks, so this cannot be used to
+  // probe whether an address is registered without holding a valid code.
+  const emailTaken = await Users.findOne({
+    email: newEmail,
+    _id: { $ne: user._id },
+  });
+  if (emailTaken) {
+    throw new Errors.BadRequestError(errMsg.EMAIL_ALREADY_IN_USE);
   }
 
   user.email = newEmail;
@@ -160,11 +180,13 @@ export async function getAllUsers(
 
   // Add search functionality
   if (search) {
+    // Escaped — see utils/escape-regex.ts for why this is not cosmetic.
+    const safeSearch = escapeRegex(search);
     query.$or = [
-      { firstName: { $regex: search, $options: "i" } },
-      { lastName: { $regex: search, $options: "i" } },
-      { email: { $regex: search, $options: "i" } },
-      { phoneNumber: { $regex: search, $options: "i" } },
+      { firstName: { $regex: safeSearch, $options: "i" } },
+      { lastName: { $regex: safeSearch, $options: "i" } },
+      { email: { $regex: safeSearch, $options: "i" } },
+      { phoneNumber: { $regex: safeSearch, $options: "i" } },
     ];
   }
 
@@ -239,6 +261,17 @@ export async function changePassword(
 
   // Update password
   user.password = hashedNewPassword;
+
+  // Revoke the refresh token along with the old password. `Users.refreshToken`
+  // is the server side of the httpOnly refresh cookie — auth.service's
+  // refreshToken() mints a fresh hour-long access token for anyone presenting
+  // a cookie that still equals this field. Leaving it in place meant a
+  // password change, the action a person takes precisely *because* they think
+  // someone else has their session, revoked nothing: the other session kept
+  // refreshing itself indefinitely. Clearing it makes every session that is
+  // not the current one unusable at its next refresh.
+  user.refreshToken = "";
+
   await user.save();
 
   return {

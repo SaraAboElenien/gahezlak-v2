@@ -4,6 +4,8 @@ import { useNavigate } from "react-router-dom";
 import { useEffect } from "react";
 import toast from "react-hot-toast";
 import { useUserSubscription } from "../hooks/useSubscriptions";
+import { useTranslation } from "react-i18next";
+import PageLoading from "./PageLoading";
 
 export default function RedirectIfAuthenticated({
   children,
@@ -11,6 +13,7 @@ export default function RedirectIfAuthenticated({
   children: React.ReactNode;
 }) {
   const navigate = useNavigate();
+  const { t } = useTranslation();
   const { user: userData, loading: isLoading } = useProfile();
 
   // Check if user is authenticated (can fetch profile successfully)
@@ -66,15 +69,16 @@ export default function RedirectIfAuthenticated({
     userData,
   ]);
 
-  // Show loading while checking
+  // Show loading while checking. This is the login/landing entry point, and
+  // the profile bootstrap behind it is usually the first API call a visitor
+  // makes — so it is the one most likely to hit a sleeping backend. PageLoading
+  // escalates to the cold-start explanation on its own once that happens.
   if (isLoading) {
     return (
-      <div className="w-full flex items-center justify-center py-8">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto mb-3"></div>
-          <p className="text-sm text-gray-600">Checking authentication...</p>
-        </div>
-      </div>
+      <PageLoading
+        className="w-full"
+        label={t("common.checkingAuthentication")}
+      />
     );
   }
 

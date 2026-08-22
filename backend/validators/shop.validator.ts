@@ -68,14 +68,20 @@ export const updateShopValidator = [
 ];
 
 export const validateRegenerateQRCode = [
+  // .toInt() matters as much as the bounds here: isInt() accepts the *string*
+  // "600" as valid, and the handler passes the value straight to QRCode as a
+  // pixel width. Without the sanitiser a well-formed request can still reach
+  // the encoder with a string where it expects a number.
   body("width")
     .optional()
     .isInt({ min: 100, max: 1000 })
-    .withMessage("Width must be between 100 and 1000"),
+    .withMessage("Width must be between 100 and 1000")
+    .toInt(),
   body("margin")
     .optional()
     .isInt({ min: 0, max: 10 })
-    .withMessage("Margin must be between 0 and 10"),
+    .withMessage("Margin must be between 0 and 10")
+    .toInt(),
   body("errorCorrectionLevel")
     .optional()
     .isIn(["L", "M", "Q", "H"])

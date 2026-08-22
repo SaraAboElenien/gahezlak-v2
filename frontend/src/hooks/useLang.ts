@@ -1,20 +1,30 @@
 import { useTranslation } from "react-i18next";
 
+import {
+  applyDocumentLanguage,
+  storeLanguage,
+  type SupportedLanguage,
+} from "../libs/i18n";
+
 export const useLang = () => {
   const { i18n } = useTranslation();
 
-  const changeLanguage = (lang: "en" | "ar") => {
-    if (typeof i18n.changeLanguage === "function") {
-      i18n.changeLanguage(lang);
-      document.documentElement.lang = lang;
-      document.documentElement.dir = lang === "ar" ? "rtl" : "ltr";
-    } else {
+  const changeLanguage = (lang: SupportedLanguage) => {
+    if (typeof i18n.changeLanguage !== "function") {
       console.error("i18n.changeLanguage is not a function");
+      return;
     }
+
+    i18n.changeLanguage(lang);
+    // Persisting is what makes the choice survive a full page load. Without
+    // it the language reset to English on every refresh, shared link and
+    // scanned QR code — see the note on LANGUAGE_STORAGE_KEY in libs/i18n.ts.
+    storeLanguage(lang);
+    applyDocumentLanguage(lang);
   };
 
   const toggleLanguage = () => {
-    const newLang = i18n.language === "en" ? "ar" : "en";
+    const newLang: SupportedLanguage = i18n.language === "en" ? "ar" : "en";
     changeLanguage(newLang);
   };
 

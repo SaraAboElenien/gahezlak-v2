@@ -14,7 +14,14 @@ Restaurants get a dashboard for menus, staff, live orders and analytics — on a
 ![Node](https://img.shields.io/badge/Node-22.x-5FA04E?logo=node.js&logoColor=white)
 ![MongoDB](https://img.shields.io/badge/MongoDB-Atlas-47A248?logo=mongodb&logoColor=white)
 
+### [**▶ Live demo**](https://gahezlak-web.onrender.com) · [Sample restaurant menu](https://gahezlak-web.onrender.com/shops/Fauget/menu) · [API health](https://gahezlak-api.onrender.com/health)
+
 </div>
+
+> [!NOTE]
+> **The first request can take up to a minute.** The demo runs on Render's free tier, which spins a service down after 15 minutes without traffic; the next visitor pays for the wake-up. This is a hosting-plan choice, not a performance characteristic of the app — once awake it responds normally.
+>
+> Two things were done about it rather than leaving a blank screen. The frontend server pokes the API's `/health` the moment it starts waking, so both services come up **in parallel** instead of one after the other — roughly halving the worst case. And any request that passes ~2.8 seconds swaps its spinner for a notice that says what is happening, with a running clock, in English or Arabic. A naive uptime pinger was deliberately **not** used: Render's free tier allows 750 instance-hours per workspace per month and two always-on services need ~1,460, so pinging them awake around the clock would exhaust the allowance and suspend both.
 
 ---
 
@@ -55,8 +62,6 @@ Restaurants get a dashboard for menus, staff, live orders and analytics — on a
 <img src="docs/screenshots/16.png" alt="Gahezlak screenshot" width="900">
 
 <img src="docs/screenshots/17.png" alt="Gahezlak screenshot" width="900">
-
-<img src="docs/screenshots/18.png" alt="Gahezlak screenshot" width="900">
 
 </div>
 
@@ -226,7 +231,9 @@ Both seeds are idempotent and safe to re-run.
 
 ### Optional features
 
-- **AI menu tools** — photo-to-menu OCR and allergy/diet-aware search, **off by default**. They need `ANTHROPIC_API_KEY` on the backend *and* `VITE_AI_ENABLED=true` on the frontend; setting only one gives either a UI whose requests are refused or working endpoints with no way to reach them. Enrichment runs per shop (`POST /ai/menu/enrich-all`) — until it does, dietary filters correctly treat every item as unsafe and show nothing.
+- **AI menu tools** — photo-to-menu OCR and allergy/diet-aware search. **Live on the hosted demo**, and off by default in a fresh clone because they bill a third-party account per request. They need `ANTHROPIC_API_KEY` on the backend *and* `VITE_AI_ENABLED=true` on the frontend; setting only one gives either a UI whose requests are refused or working endpoints with no way to reach them. Enrichment runs per shop (`POST /ai/menu/enrich-all`) — until it does, dietary filters correctly treat every item as unsafe and show nothing.
+
+  Two models are configured on purpose. `AI_MODEL` (cheap) serves search and OCR, which run once per visitor; `AI_ENRICH_MODEL` (`claude-opus-5`) serves allergen enrichment, which runs once per dish and decides whether someone with a nut allergy is shown a dish containing pesto. Haiku returned *different allergen sets across two runs of the same menu*, once dropping tree nuts from a pesto wrap — which is why the safety-relevant path does not share the cheap model.
 - **Payments** — need a Paymob account. Each integration has one job: card/3DS for checkout, wallet for mobile wallets, MOTO for recurring subscription deductions, and a verification integration for a trial's first transaction. Cash means pay in person and never touches Paymob.
 
 ---
@@ -267,9 +274,22 @@ CI runs typecheck, lint, tests and a real build for both packages on every push 
 
 Feature-complete and covered by tests; the payment integration runs against Paymob's sandbox. Known gaps are tracked honestly rather than hidden:
 
-- Paid orders confirm via a Paymob webhook, which needs a publicly reachable backend — so in local development an order stays `Pending` after a successful sandbox payment.
-- AI menu features are switched off pending API credits.
-- No end-to-end test suite yet; the full journey has been verified by hand.
+- Paid orders confirm via a Paymob webhook, which needs a **publicly reachable** backend. In local development Paymob's servers cannot reach `localhost`, so an order stays `Pending` after a successful sandbox payment — the payment itself succeeds, only the confirmation callback is lost. To exercise the full path locally, expose the backend through a tunnel and point `ORDER_WEBHOOK_URL` at it:
+
+  ```bash
+  ngrok http 3000        # or: cloudflared tunnel --url http://localhost:3000
+  ```
+
+  Then set both in `backend/.env`, using the public HTTPS URL the tunnel prints, and restart the API:
+
+  ```ini
+  ORDER_WEBHOOK_URL=https://<subdomain>.ngrok-free.app/api/v1/webhooks/paymob/orders
+  SUBSCRIPTION_WEBHOOK_URL=https://<subdomain>.ngrok-free.app/api/v1/webhooks/paymob/subscriptions
+  ```
+
+  The URL changes on each tunnel restart unless you have a reserved domain, so this is a per-session step rather than something to commit. Note the values are read once at module load in `utils/paymob.ts` — a restart is required, not just a save.
+
+- The Paymob integration runs against the **sandbox**, not live. Going live with recurring subscriptions additionally requires Risk Approval on the merchant account, which is an account process rather than a configuration change.
 
 ---
 

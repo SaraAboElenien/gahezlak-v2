@@ -637,7 +637,14 @@
   "common": {
     "errors": {
       "generic": "An error occurred. Please try again."
-    }
+    },
+    "checkingAuthentication": "Checking authentication..."
+  },
+  "serverWaking": {
+    "title": "Waking the server up",
+    "body": "This demo runs on free hosting that puts the server to sleep after a while with no visitors. It is starting back up right now.",
+    "reassure": "This can take up to a minute, and only happens on the first visit — everything is fast once it is awake.",
+    "progress": "{{elapsed}}s of about {{estimated}}s"
   },
   "staffPage": {
     "title": "Staff Management",
@@ -749,6 +756,8 @@
   "marking": "Marking...",
   "completeOrder": "Complete Order",
   "completing": "Completing...",
+  "cancelOrder": "Cancel Order",
+  "cancelling": "Cancelling...",
   "updateStatus": "Update Status",
   "viewDetails": "View Details",
   "updateOrderStatus": "Update Order Status",

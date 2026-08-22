@@ -140,14 +140,29 @@ describe("sendEmail — failure reporting", () => {
     ).resolves.toBe(false);
   });
 
-  it("still throws when credentials are absent, rather than failing silently", async () => {
+  it("returns false rather than throwing when credentials are absent", async () => {
     const { sendEmail } = await load();
 
-    // The one case that must be loud: no credentials is a deployment mistake,
-    // not a transient relay problem.
+    // REVERSED 2026-08-21, deliberately. This previously asserted a throw, on
+    // the reasoning that "no credentials is a deployment mistake, not a
+    // transient relay problem" and must be loud. The reasoning still holds —
+    // the mechanism was the problem.
+    //
+    // getTransporter() throws synchronously and was called OUTSIDE this
+    // function's try block, so sendEmail rejected despite its Promise<boolean>
+    // signature. That happened mid-request, after signUp had already written
+    // the user row: the caller got a 500 while a half-activated account existed
+    // that the person could neither verify nor re-register with. Being loud
+    // cost more than being silent did.
+    //
+    // The loudness moved to boot instead — config/env-validation.ts warns once,
+    // at startup, where an operator can act on it and nobody is halfway through
+    // a signup. Here the boolean is the single failure channel, and the error is
+    // logged with its cause.
     await expect(
       sendEmail("someone@example.com", "Subject", "<b>hi</b>"),
-    ).rejects.toThrow(/credentials are not set/i);
+    ).resolves.toBe(false);
     expect(createTransportMock).not.toHaveBeenCalled();
+    expect(sendMailMock).not.toHaveBeenCalled();
   });
 });

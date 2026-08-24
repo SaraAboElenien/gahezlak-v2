@@ -33,6 +33,25 @@ const REQUIRED_ENV_VARS = [
 // integration in this codebase degrades (see the note above).
 const EMAIL_ENV_VARS = ["sendEmail", "emailPassword"] as const;
 
+// Same reasoning as EMAIL_ENV_VARS, for the other integration whose absence
+// stays invisible until a customer is already out of pocket.
+//
+// These two are handed straight to Paymob as `notification_url` and
+// `webhook_url` (see utils/paymob.ts). Unset, `undefined` is sent, Paymob
+// calls nobody, and payment.webhook.controller.ts never runs — so a real,
+// fully paid order sits at `orderStatus: "Pending"` forever with no error
+// anywhere: the charge succeeds, the customer is billed, and the shop simply
+// never sees the order. That exact failure was live in this project for weeks
+// and read as a payments bug rather than a missing env var.
+//
+// A warning rather than a throw, for the same reason as above: they are
+// genuinely optional in local dev (Paymob cannot reach localhost regardless),
+// and refusing to boot over them would turn a degraded feature into an outage.
+const WEBHOOK_ENV_VARS = [
+  "ORDER_WEBHOOK_URL",
+  "SUBSCRIPTION_WEBHOOK_URL",
+] as const;
+
 export function validateEnv(): void {
   const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
 
@@ -53,6 +72,17 @@ export function validateEnv(): void {
       `[env] Email is not configured (missing: ${missingEmail.join(", ")}). ` +
         "Signup, resend-verification and password-reset will create codes that " +
         "are never delivered. Set them to enable outbound mail.",
+    );
+  }
+
+  const missingWebhooks = WEBHOOK_ENV_VARS.filter((name) => !process.env[name]);
+
+  if (missingWebhooks.length > 0) {
+    console.warn(
+      `[env] Paymob webhooks are not configured (missing: ${missingWebhooks.join(", ")}). ` +
+        "Payments will still be taken, but nothing will call back to confirm them: " +
+        "paid orders stay Pending and subscription lifecycle events are never applied. " +
+        "Point them at this API public /api/v1/webhooks/paymob/* routes.",
     );
   }
 }

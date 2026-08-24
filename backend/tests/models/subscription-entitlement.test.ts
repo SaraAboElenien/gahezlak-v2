@@ -87,6 +87,14 @@ describe("isEntitledToService", () => {
 describe("entitledToServiceFilter agrees with isEntitledToService", () => {
   beforeAll(async () => {
     await connectTestDB();
+    // Mongoose builds declared indexes in the background, so without this the
+    // unique constraint on `shop` may or may not exist by the time the
+    // inserts below run. That race is not hypothetical: this file inserted
+    // six rows sharing one shop and passed only while the index build lost,
+    // then began failing with E11000 the moment worker scheduling shifted.
+    // Waiting for the indexes makes the schema the test runs against the same
+    // one production runs against.
+    await Subscriptions.init();
   });
 
   afterAll(async () => {
@@ -98,7 +106,10 @@ describe("entitledToServiceFilter agrees with isEntitledToService", () => {
   });
 
   it("selects exactly the rows the predicate admits", async () => {
-    const shop = new mongoose.Types.ObjectId();
+    // `shop` is `unique: true` on the model, so these six rows cannot share
+    // one shop the way this fixture originally had them — that combination is
+    // unrepresentable in production. Each row gets its own shop and the query
+    // is scoped by the created ids instead.
     const rows = [
       { status: SubscriptionStatus.ACTIVE, currentPeriodEnd: future() },
       { status: SubscriptionStatus.TRIALING, currentPeriodEnd: future() },
@@ -110,7 +121,7 @@ describe("entitledToServiceFilter agrees with isEntitledToService", () => {
 
     const created = await Subscriptions.create(
       rows.map((r) => ({
-        shop,
+        shop: new mongoose.Types.ObjectId(),
         userId: new mongoose.Types.ObjectId(),
         plan: new mongoose.Types.ObjectId(),
         currentPeriodStart: new Date(Date.now() - 5 * DAY),
@@ -119,7 +130,7 @@ describe("entitledToServiceFilter agrees with isEntitledToService", () => {
     );
 
     const matched = await Subscriptions.find({
-      shop,
+      _id: { $in: created.map((d) => d._id) },
       ...entitledToServiceFilter(),
     })
       .select("_id")

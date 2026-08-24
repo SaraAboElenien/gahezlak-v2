@@ -28,6 +28,45 @@ import { assertShopHasActiveSubscription } from "../middlewares/subscription-che
 import { Orders } from "../models/Order";
 //import { io } from "../sockets/socketServer";
 
+const CUSTOMER_SUPPLIED_ORDER_FIELDS = [
+  "tableNumber",
+  "orderItems",
+  "customerFirstName",
+  "customerLastName",
+  "customerPhoneNumber",
+  "paymentMethod",
+] as const satisfies readonly (keyof IOrder)[];
+
+/**
+ * The exact shape `CreateOrder` needs, minus the two fields the server
+ * derives itself. Typed as required rather than `Partial` because
+ * `validateCreateOrder` has already rejected the request if any of them is
+ * missing — modelling them as optional here would push a `!` or a fallback
+ * onto every downstream reader for a case that cannot reach this point.
+ */
+type CustomerOrderInput = Omit<
+  Parameters<typeof CreateOrder>[0],
+  "shopId" | "orderNumber"
+>;
+
+export function pickCustomerOrderFields(
+  body: Partial<IOrder>,
+): CustomerOrderInput {
+  const picked: Partial<IOrder> = {};
+  for (const field of CUSTOMER_SUPPLIED_ORDER_FIELDS) {
+    const value = body[field];
+    if (value !== undefined) {
+      // TypeScript cannot correlate the key with its value type while `field`
+      // ranges over a union of keys, so it widens the target to `never`. The
+      // assignment is sound — the same `field` indexes both objects.
+      (picked as Record<string, unknown>)[field] = value;
+    }
+  }
+  // Sound for the reason given on CustomerOrderInput: the validator
+  // guarantees presence, and this cast is the single place that claim is made.
+  return picked as CustomerOrderInput;
+}
+
 export const createOrderHandler: RequestHandler<
   unknown,
   SuccessResponse<{
@@ -46,7 +85,27 @@ export const createOrderHandler: RequestHandler<
     shopName: string;
   }
 > = async (req, res) => {
-  const { shopName, ...orderData } = req.body;
+  // ALLOWLIST, not a spread. This route is deliberately public — a diner
+  // ordering from a QR code is not logged in — and `validateCreateOrder`
+  // only checks the fields it names, stripping nothing. Spreading `req.body`
+  // therefore let an anonymous caller set ANY column on the new document, and
+  // two of them are the payment system:
+  //
+  //   `orderStatus`   defaults to Pending and is meant to reach Confirmed
+  //                   only via handleOrderPaid() when Paymob says money
+  //                   arrived. Posting "Confirmed" put a fully-paid-looking
+  //                   order on the kitchen queue, indistinguishable from a
+  //                   real one, for free.
+  //   `paymobTransactionId`  likewise forgeable, so the forged order even
+  //                   carried a plausible-looking receipt.
+  //
+  // Every other field CreateOrder handles already: price, discountPercentage
+  // and totalAmount are recomputed from the menu, shopId and orderNumber are
+  // overridden. These six are the only ones a customer legitimately supplies.
+  // Seventh instance of the mass-assignment shape in this codebase, and the
+  // first on a create path with no authentication at all — see TECH_DEBT.md.
+  const { shopName } = req.body;
+  const orderData = pickCustomerOrderFields(req.body);
   const shop = await ShopService.getShop({ shopName });
   if (!shop) {
     throw new Errors.NotFoundError(errMsg.SHOP_NOT_FOUND);

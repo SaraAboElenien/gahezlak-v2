@@ -451,27 +451,19 @@ describe("getCategoriesByShop", () => {
     expect(categories).toEqual([]);
   });
 
-  it("returns every shop's categories when given no selector at all", async () => {
+  it("refuses to guess when given no selector at all", async () => {
     const { getCategoriesByShop } = await categoryService();
     await seedCategory({ shopId: SHOP_A, name: { en: "Mine", ar: "لي" } });
     await seedCategory({ shopId: SHOP_B, name: { en: "Theirs", ar: "لهم" } });
 
-    const categories = await getCategoriesByShop({ lang: "en" });
-
-    // CURRENT BEHAVIOUR, not desired behaviour. With neither `shopId` nor
-    // `shopName` the filter is `{}`, so this is a cross-tenant read of the
-    // whole platform's menu structure. It is the third instance of the shape
-    // already logged in TECH_DEBT.md as "Two multi-tenant queries return
-    // everything when given no selector" (`getShop`, `getMenuItemsByShop`) —
-    // reported rather than fixed here so all three are closed together by the
-    // same decision, since fixing one in isolation leaves the pattern alive
-    // and the entry stale.
-    //
-    // Latent today: the public route always supplies `:shopName` from its own
-    // path, and the authenticated route is behind `isShopMember`, which
-    // rejects a token carrying no `shopId`. The guard is a property of the
-    // callers, not of this function.
-    expect(categories).toHaveLength(2);
+    // Regression test: with neither `shopId` nor `shopName` the filter used
+    // to collapse to `{}`, a cross-tenant read of the whole platform's menu
+    // structure. "No selector" must mean "not found", not "every shop". See
+    // TECH_DEBT.md, "multi-tenant queries return everything when given no
+    // selector".
+    await expect(getCategoriesByShop({ lang: "en" })).rejects.toThrow(
+      "A shop id or shop name is required.",
+    );
   });
 });
 

@@ -49,6 +49,35 @@ describe("isEntitledToService", () => {
     ).toBe(true);
   });
 
+  it("admits a trial that is still running", () => {
+    expect(
+      isEntitledToService({
+        status: SubscriptionStatus.TRIALING,
+        currentPeriodEnd: future(),
+      }),
+    ).toBe(true);
+  });
+
+  /**
+   * The bug this pins: TRIALING used to return `true` unconditionally, so a
+   * free trial never ended. Nothing transitions `trialing` -> `expired` —
+   * the only writer of EXPIRED is the Paymob "suspended" webhook, which
+   * cannot fire for a trial that never converted to billing, and there is no
+   * cron anywhere in this backend. The deployed shop was still taking orders
+   * ten days past its trial end when this was found.
+   *
+   * Do NOT "fix" a failure here by relaxing the assertion — that restores an
+   * unlimited free tier.
+   */
+  it("refuses a trial whose period has ended", () => {
+    expect(
+      isEntitledToService({
+        status: SubscriptionStatus.TRIALING,
+        currentPeriodEnd: past(),
+      }),
+    ).toBe(false);
+  });
+
   it("refuses a cancelled subscription past its paid period", () => {
     expect(
       isEntitledToService({
@@ -113,6 +142,9 @@ describe("entitledToServiceFilter agrees with isEntitledToService", () => {
     const rows = [
       { status: SubscriptionStatus.ACTIVE, currentPeriodEnd: future() },
       { status: SubscriptionStatus.TRIALING, currentPeriodEnd: future() },
+      // The expired trial: absent from this table, the two encodings could
+      // disagree about it and no test would notice.
+      { status: SubscriptionStatus.TRIALING, currentPeriodEnd: past() },
       { status: SubscriptionStatus.CANCELLED, currentPeriodEnd: future() },
       { status: SubscriptionStatus.CANCELLED, currentPeriodEnd: past() },
       { status: SubscriptionStatus.PENDING, currentPeriodEnd: future() },

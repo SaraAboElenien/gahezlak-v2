@@ -71,6 +71,7 @@ enum errorMessage {
   TOO_MANY_REQUESTS = "TOO_MANY_REQUESTS",
   TOO_MANY_OTP_ATTEMPTS = "TOO_MANY_OTP_ATTEMPTS",
   SHOP_NOT_ACCEPTING_ORDERS = "SHOP_NOT_ACCEPTING_ORDERS",
+  SHOP_SELECTOR_REQUIRED = "SHOP_SELECTOR_REQUIRED",
 }
 
 export const errMsg: {
@@ -344,5 +345,9 @@ export const errMsg: {
   SHOP_NOT_ACCEPTING_ORDERS: {
     en: "This shop is not currently accepting orders. Please try again later.",
     ar: "هذا المتجر لا يستقبل الطلبات حاليًا. يرجى المحاولة مرة أخرى لاحقًا.",
+  },
+  SHOP_SELECTOR_REQUIRED: {
+    en: "A shop id or shop name is required.",
+    ar: "معرف المتجر أو اسمه مطلوب.",
   },
 };

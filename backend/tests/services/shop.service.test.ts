@@ -268,6 +268,92 @@ describe("createShop", () => {
     expect(created.qrCodeUrl).toBe("https://i.ibb.co/qr.png");
     expect(created.subscriptionId).toBeNull();
   });
+
+  /**
+   * MASS-ASSIGNMENT REGRESSION (closed 2026-08-24) — the permissive half.
+   *
+   * `createShop`'s parameter was typed `Pick<IShop, "name"|"type"|"address"|
+   * "phoneNumber"|"email"|"qrCodeUrl"|"logoUrl">`, but that is a
+   * compile-time constraint only: `createShopHandler` builds the object it
+   * actually passes as `{ ...req.body, qrCodeUrl, logoUrl }`, and
+   * `Shops.create({ ...shopData, ownerId })` spread it straight into the
+   * write with nothing stripping fields the type didn't name. Following the
+   * lesson from the `updateShop` regression above — an allowlist that is
+   * never tested in its permissive direction can silently drop a legitimate
+   * field while still returning 200 — this asserts every field the
+   * shop-creation form actually submits, plus the two the controller derives
+   * itself, all round-trip together.
+   */
+  it("persists every field an ordinary shop-creation form submits", async () => {
+    const { createShop } = await shopService();
+
+    const created = await createShop(
+      shopInput({
+        name: "Round Trip Bistro",
+        type: "cafe",
+        address: { country: "EG", city: "Giza", street: "9 Nile St" },
+        phoneNumber: "01055555555",
+        email: "roundtrip@example.com",
+        qrCodeUrl: "https://i.ibb.co/qr.png",
+        logoUrl: "https://i.ibb.co/logo.png",
+      }),
+      OWNER_A.toString(),
+    );
+
+    expect(created.name).toBe("Round Trip Bistro");
+    expect(created.type).toBe("cafe");
+    expect(created.address).toMatchObject({ city: "Giza" });
+    expect(created.phoneNumber).toBe("01055555555");
+    expect(created.email).toBe("roundtrip@example.com");
+    expect(created.qrCodeUrl).toBe("https://i.ibb.co/qr.png");
+    expect(created.logoUrl).toBe("https://i.ibb.co/logo.png");
+
+    // Read back from the database rather than trusting the returned
+    // document: the bug this pins would be a silently dropped write, not a
+    // thrown error.
+    const stored = await Shops.findById(created._id).lean();
+    expect(stored?.type).toBe("cafe");
+    expect(stored?.logoUrl).toBe("https://i.ibb.co/logo.png");
+  });
+
+  /**
+   * MASS-ASSIGNMENT REGRESSION (closed 2026-08-24) — the restrictive half.
+   *
+   * `Shop` declares `subscriptionId` and `isPaymentDone` alongside the fields
+   * a creation form legitimately sets, and neither was named by the `Pick`
+   * type `createShopHandler`'s payload was merely cast to — so both rode
+   * through the `{ ...req.body }` spread unfiltered. Traced and confirmed
+   * low-impact, not a privilege escalation: the real subscription gate
+   * (`assertShopHasActiveSubscription`) queries the `Subscriptions`
+   * collection by `{ shop: shopId }` and never reads `Shop.subscriptionId`,
+   * which is populated only for display in `getUserProfile`; `isPaymentDone`
+   * has no reader anywhere in the codebase. The reason to close it anyway:
+   * the guard belongs to the function, not the caller, so a future feature
+   * that starts trusting either field should not inherit a live hole.
+   */
+  it("does not let the create body set subscriptionId or isPaymentDone", async () => {
+    const { createShop } = await shopService();
+    const foreignSubscriptionId = new mongoose.Types.ObjectId();
+
+    const created = await createShop(
+      shopInput({
+        subscriptionId: foreignSubscriptionId,
+        isPaymentDone: true,
+      }),
+      OWNER_A.toString(),
+    );
+
+    expect(created.subscriptionId).toBeNull();
+    expect(
+      (created as unknown as { isPaymentDone?: boolean }).isPaymentDone,
+    ).toBeUndefined();
+
+    const stored = await Shops.findById(created._id).lean();
+    expect(stored?.subscriptionId).toBeNull();
+    expect(
+      (stored as unknown as { isPaymentDone?: boolean } | null)?.isPaymentDone,
+    ).toBeUndefined();
+  });
 });
 
 describe("getUserShop", () => {
@@ -354,19 +440,19 @@ describe("getShop", () => {
     );
   });
 
-  it("returns an arbitrary shop, in full, when given neither a name nor an id", async () => {
+  it("refuses to guess when given neither a name nor an id", async () => {
     const { getShop } = await shopService();
     await seedShop({ email: "private@example.com" });
 
-    const found = await getShop({});
-
-    // CURRENT BEHAVIOUR, not desired behaviour: with both arguments absent the
-    // filter is `{}` and the projection is `{}`, so this hands back the first
-    // shop in the collection with every private field attached. Unreachable
-    // today because each of the two routes supplies exactly one of the pair
-    // from its own path. "No selector" should mean "not found", not "any
-    // shop". Reported; do not "fix" by changing this assertion.
-    expect(found.email).toBe("private@example.com");
+    // Regression test: `getShop({})` used to fall back to filter `{}`, which
+    // handed back an arbitrary shop in full — ownerId, email, phoneNumber and
+    // members included — to whichever caller forgot to pass a selector. "No
+    // selector" must mean "not found", not "any tenant's data". See
+    // TECH_DEBT.md, "multi-tenant queries return everything when given no
+    // selector".
+    await expect(getShop({})).rejects.toThrow(
+      "A shop id or shop name is required.",
+    );
   });
 });
 

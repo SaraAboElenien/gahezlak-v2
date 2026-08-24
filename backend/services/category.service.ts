@@ -151,6 +151,14 @@ export async function getCategoriesByShop({
   shopName?: string;
   lang: LangType;
 }) {
+  if (!shopId && !shopName) {
+    // With neither argument the filter below would collapse to `{}` and
+    // return every tenant's categories. "No selector" must mean "not found",
+    // not "every shop" — same family as the order IDOR fixed 2026-07-30. See
+    // TECH_DEBT.md.
+    throw new Errors.BadRequestError(errMsg.SHOP_SELECTOR_REQUIRED);
+  }
+
   const query: FilterQuery<ICategory> = {};
 
   if (shopId) {

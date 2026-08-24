@@ -149,6 +149,14 @@ export async function getMenuItemsByShop({
   skip?: number;
   limit?: number;
 }) {
+  if (!shopId && !shopName) {
+    // With neither argument the filter below would collapse to `{}` and
+    // return every tenant's menu items. "No selector" must mean "not found",
+    // not "every shop" — same family as the order IDOR fixed 2026-07-30.
+    // See TECH_DEBT.md.
+    throw new Errors.BadRequestError(errMsg.SHOP_SELECTOR_REQUIRED);
+  }
+
   const query: FilterQuery<IMenuItem> = {};
 
   if (shopId) {

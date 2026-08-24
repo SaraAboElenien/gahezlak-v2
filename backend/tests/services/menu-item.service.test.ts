@@ -563,23 +563,18 @@ describe("getMenuItemsByShop", () => {
     expect(items[0]._id.toString()).toBe(rival._id.toString());
   });
 
-  it("returns every shop's items when given neither a shop id nor a name", async () => {
+  it("refuses to guess when given neither a shop id nor a name", async () => {
     const { getMenuItemsByShop } = await menuItemService();
     await seedItem({ shopId: SHOP_A });
     await seedItem({ shopId: SHOP_B });
 
-    const { items, totalCount } = await getMenuItemsByShop({ lang: "en" });
-
-    // CURRENT BEHAVIOUR, not desired behaviour: with both arguments absent the
-    // filter is `{}` and the query spans every tenant. Unreachable today only
-    // because both callers of this function always supply one — the public
-    // route has `:shopName` in its path, and the authenticated route is behind
-    // `isShopMember`, which rejects a token carrying no shopId before the
-    // handler runs. A default of "all shops" is the wrong default for a
-    // multi-tenant query regardless. Reported; do not "fix" by changing this
-    // assertion.
-    expect(items).toHaveLength(2);
-    expect(totalCount).toBe(2);
+    // Regression test: with both arguments absent the filter used to collapse
+    // to `{}` and the query spanned every tenant. "No selector" must mean
+    // "not found", not "every shop's menu". See TECH_DEBT.md, "multi-tenant
+    // queries return everything when given no selector".
+    await expect(getMenuItemsByShop({ lang: "en" })).rejects.toThrow(
+      "A shop id or shop name is required.",
+    );
   });
 
   it("sorts newest first", async () => {

@@ -42,7 +42,12 @@ export const createShopHandler: RequestHandler<
     logoUrl = imgbbResponse?.data?.url;
   }
 
-  // Create the shop
+  // Create the shop. `payload`'s type is a compile-time constraint only —
+  // `...req.body` is whatever JSON the client actually sent, which could
+  // carry fields like `subscriptionId`/`isPaymentDone` this type doesn't
+  // name. ShopService.createShop applies its own runtime allowlist
+  // (CREATABLE_SHOP_FIELDS) before persisting, so this spread is safe despite
+  // looking otherwise.
   const payload: Parameters<typeof ShopService.createShop>[0] = {
     ...req.body,
     qrCodeUrl: qrCodeResult.qrCodeUrl,

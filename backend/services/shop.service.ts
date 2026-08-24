@@ -14,6 +14,60 @@ import { collectionsName } from "../common/collections-name";
 import { escapeRegex } from "../utils/escape-regex";
 import { isAssignableMemberRole } from "./role.service";
 
+/**
+ * Fields shop creation is permitted to set — every field the "create my
+ * restaurant" form submits, plus `qrCodeUrl`/`logoUrl`, which
+ * `createShopHandler` derives itself (a freshly generated QR code, and an
+ * imgbb upload) rather than taking from the request body.
+ *
+ * This allowlist is the security control, not a tidiness measure, for the
+ * same reason `UPDATABLE_SHOP_FIELDS` below is one: the `Pick<IShop, ...>`
+ * parameter type is a compile-time constraint only. `createShopHandler`
+ * builds the object it actually hands this function as
+ * `{ ...req.body, qrCodeUrl, logoUrl }`, and TypeScript's structural typing
+ * does nothing to strip properties an incoming JSON body happens to carry
+ * beyond the ones the type names — the same gap `pickUpdatableShopFields`
+ * closes for updates. `Shop` also declares `subscriptionId` (written only by
+ * the Paymob webhook once a real subscription exists — see
+ * `payment.webhook.controller.ts`) and `isPaymentDone`, neither of which a
+ * shop-creation form should ever set.
+ *
+ * Traced and confirmed low-impact rather than a privilege escalation:
+ * `subscriptionId` is read only for display, via `getUserProfile`'s populate
+ * chain — the actual subscription gate
+ * (`assertShopHasActiveSubscription` in
+ * `subscription-check.middleware.ts`) queries the `Subscriptions` collection
+ * by `{ shop: shopId }` and never reads this field, so forging it only risks
+ * a misleading "already subscribed" UI redirect, not access to a
+ * subscription-gated route. `isPaymentDone` isn't declared on `ShopSchema` at
+ * all, so Mongoose's default strict mode already drops it silently. The
+ * allowlist closes the gap anyway, so a future feature that starts trusting
+ * either field does not inherit a live hole.
+ */
+const CREATABLE_SHOP_FIELDS = [
+  "name",
+  "type",
+  "address",
+  "phoneNumber",
+  "email",
+  "qrCodeUrl",
+  "logoUrl",
+] as const satisfies readonly (keyof IShop)[];
+
+function pickCreatableShopFields(shopData: Partial<IShop>): Partial<IShop> {
+  const picked: Partial<IShop> = {};
+  for (const field of CREATABLE_SHOP_FIELDS) {
+    const value = shopData[field];
+    if (value !== undefined) {
+      // TypeScript cannot correlate the key with its value type while `field`
+      // ranges over a union of keys, so it widens the target to `never`. The
+      // assignment is sound — the same `field` indexes both objects.
+      (picked as Record<string, unknown>)[field] = value;
+    }
+  }
+  return picked;
+}
+
 async function createShop(
   shopData: Pick<
     IShop,
@@ -36,7 +90,7 @@ async function createShop(
   }
 
   const shop = await Shops.create({
-    ...shopData,
+    ...pickCreatableShopFields(shopData),
     ownerId: new mongoose.Types.ObjectId(currentUserId),
   });
 
@@ -69,6 +123,16 @@ async function getShop({
   shopName?: string;
   shopId?: string;
 }) {
+  if (!shopName && !shopId) {
+    // With neither argument the filter below would collapse to `{}` and
+    // `.findOne` would hand back an arbitrary shop in full — including
+    // `ownerId`, `email`, `phoneNumber` and `members` — to whichever caller
+    // forgot to pass a selector. "No selector" must mean "not found", not
+    // "any tenant's data", the same family as the order IDOR fixed
+    // 2026-07-30. See TECH_DEBT.md.
+    throw new Errors.BadRequestError(errMsg.SHOP_SELECTOR_REQUIRED);
+  }
+
   const query: FilterQuery<IShop> = {};
   let select: ProjectionFields<IShop> = {};
   if (shopName) {

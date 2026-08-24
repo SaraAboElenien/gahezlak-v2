@@ -98,8 +98,23 @@ export function isEntitledToService(
 
   switch (subscription.status) {
     case SubscriptionStatus.ACTIVE:
-    case SubscriptionStatus.TRIALING:
       return true;
+    // TRIALING is gated on the clock exactly as CANCELLED is. It used to
+    // return `true` unconditionally, which meant a free trial never ended:
+    // nothing anywhere transitions `trialing` -> `expired` (the only writer
+    // of EXPIRED is the Paymob "suspended" webhook, which by definition
+    // cannot fire for a trial that never converted to billing, and this
+    // project has no cron or scheduler of any kind). The deployed shop was
+    // still taking orders ten days past its trial end when this was found.
+    //
+    // Note this deliberately fixes the *re-subscribe* guard at the same time,
+    // because `entitledToServiceFilter` below is the same rule and
+    // `createOrUpdatePendingSubscription` refuses to sell a plan to a shop
+    // that is still entitled. Gating access without gating that would leave a
+    // lapsed trial locked out AND unable to pay — which is precisely the
+    // cancelled-mid-period trap fixed on 2026-08-19. One predicate, one
+    // answer: that is the whole point of these two functions living together.
+    case SubscriptionStatus.TRIALING:
     case SubscriptionStatus.CANCELLED:
       return subscription.currentPeriodEnd > now;
     // PENDING has not been paid for yet; EXPIRED is past due by definition.
@@ -119,13 +134,13 @@ export function isEntitledToService(
 export function entitledToServiceFilter(now: Date = new Date()) {
   return {
     $or: [
+      { status: SubscriptionStatus.ACTIVE },
+      // Mirrors the TRIALING/CANCELLED branch of isEntitledToService above —
+      // both are entitled only while their paid-for period is still running.
       {
         status: {
-          $in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING],
+          $in: [SubscriptionStatus.TRIALING, SubscriptionStatus.CANCELLED],
         },
-      },
-      {
-        status: SubscriptionStatus.CANCELLED,
         currentPeriodEnd: { $gt: now },
       },
     ],

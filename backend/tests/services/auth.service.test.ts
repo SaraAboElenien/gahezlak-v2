@@ -5,6 +5,7 @@ import {
   beforeAll,
   afterAll,
   beforeEach,
+  afterEach,
   vi,
 } from "vitest";
 import mongoose from "mongoose";
@@ -15,6 +16,7 @@ import {
   disconnectTestDB,
   clearTestDB,
 } from "../db-test-helper";
+import { logger } from "../../config/pino";
 import type { IUser } from "../../models/User";
 
 /**
@@ -141,11 +143,23 @@ afterAll(async () => {
   await disconnectTestDB();
 });
 
+let loggerErrorSpy: ReturnType<typeof vi.spyOn>;
+
 beforeEach(async () => {
   await clearTestDB();
   vi.clearAllMocks();
   sendEmailMock.mockResolvedValue(true);
+  // See ADR-016: sendEmail() never throws, so a failed send is only
+  // observable via its boolean return and this log line. Spying here — not
+  // just asserting on the account/response — is what makes the "still reads
+  // the boolean" regression tests below actually catch a caller that goes
+  // back to discarding it.
+  loggerErrorSpy = vi.spyOn(logger, "error").mockImplementation(() => logger);
   await seedUserRole();
+});
+
+afterEach(() => {
+  loggerErrorSpy.mockRestore();
 });
 
 describe("signUp", () => {
@@ -248,6 +262,37 @@ describe("signUp", () => {
     // row would discard the user's password over a transient relay failure.
     const user = await storedUser();
     expect(user.verificationCode.code).toHaveLength(6);
+  });
+
+  // Regression for the silent-failure bug this file's header describes: a
+  // blocked SMTP relay used to be indistinguishable from a working one,
+  // because `.catch(console.error)` could never fire (sendEmail resolves
+  // `false`, it does not reject) and nothing else read the boolean. If signUp
+  // goes back to `await sendEmail(...)` without checking the result, this is
+  // the only assertion in the suite that notices — the account/response
+  // assertions above are unchanged either way, since the account is
+  // deliberately never rolled back on a failed send. See ADR-016 and the
+  // TECH_DEBT.md entry on why the *user* still isn't told (a separate,
+  // deliberately open product decision — this test is only about the
+  // operator-facing signal).
+  it("logs an operator-facing error when the verification email fails to send", async () => {
+    sendEmailMock.mockResolvedValue(false);
+
+    await register();
+
+    expect(loggerErrorSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ email: EMAIL }),
+      expect.stringMatching(/verification email failed to send/i),
+    );
+  });
+
+  it("logs nothing when the verification email sends successfully", async () => {
+    // sendEmailMock defaults to resolving `true` (see beforeEach). Symmetry
+    // check for the test above: a healthy send must not also trip the
+    // operator alert, or the signal would be meaningless noise.
+    await register();
+
+    expect(loggerErrorSpy).not.toHaveBeenCalled();
   });
 });
 

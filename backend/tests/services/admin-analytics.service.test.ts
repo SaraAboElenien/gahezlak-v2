@@ -14,6 +14,7 @@ import {
   getRevenueGrowthRate,
   getTopPerformingRestaurants,
 } from "../../services/admin-analytics.service";
+import { getPlatformTimeZoneOffsetMs } from "../../utils/report-date-window";
 
 /**
  * The admin analytics service answers three questions for the platform owner:
@@ -195,7 +196,11 @@ describe("getTotalPlatformRevenue", () => {
     await expect(getTotalPlatformRevenue("", "2026-01-01")).resolves.toBe(299);
   });
 
-  it("includes a subscription whose period sits exactly on the window boundaries ($gte/$lte are inclusive)", async () => {
+  it("includes a subscription whose period sits exactly on the requested calendar-day boundaries", async () => {
+    // `currentPeriodStart` sits exactly on the inclusive UTC-midnight start
+    // of "2026-08-01", and `currentPeriodEnd` at UTC midnight on
+    // "2026-08-31" is well before the window's real (Cairo, exclusive)
+    // close — see the Cairo-day-boundary tests below for the precise edge.
     await seedSubscription({
       price: 299,
       currentPeriodStart: new Date("2026-08-01T00:00:00.000Z"),
@@ -246,17 +251,43 @@ describe("getTotalPlatformRevenue", () => {
   });
 
   /**
-   * DEFECT (characterised, deliberately not changed here — see the report).
-   *
-   * The frontend sends calendar dates (`formatDateYMD` → "2026-08-31"), and
-   * `new Date("2026-08-31")` is **midnight UTC**, so `$lte` cuts the range at
-   * the *start* of the last day. Everything dated later that day is dropped.
+   * REGRESSION (was a DEFECT — see TECH_DEBT.md and DECISIONS.md, fixed
+   * 2026-08-24). The frontend sends calendar dates (`formatDateYMD` →
+   * "2026-08-31"). The window is now computed as a half-open
+   * PLATFORM_TIMEZONE ("Africa/Cairo") range — [start-of-Cairo-day,
+   * start-of-next-Cairo-day) — rather than `new Date("2026-08-31")`
+   * (midnight UTC) compared with `$lte`, so a period ending later on the
+   * final *Cairo* day is included instead of being cut off at the very
+   * start of that day.
    */
-  it("CHARACTERISATION: a calendar-day endDate excludes that whole final day", async () => {
+  it("includes a subscription whose period ends later on the final Cairo day of the window", async () => {
     await seedSubscription({
       price: 299,
       currentPeriodStart: new Date("2026-08-01T00:00:00.000Z"),
-      currentPeriodEnd: new Date("2026-08-31T09:00:00.000Z"), // same day, later
+      currentPeriodEnd: new Date("2026-08-31T09:00:00.000Z"), // same Cairo day, later
+    });
+
+    await expect(
+      getTotalPlatformRevenue("2026-08-01", "2026-08-31"),
+    ).resolves.toBe(299);
+  });
+
+  it("excludes a subscription whose period ends only after the window's final Cairo day", async () => {
+    // The window for endDate "2026-08-31" now closes at the start of the
+    // *next* Cairo calendar day (2026-09-01 00:00 Africa/Cairo). A period
+    // ending after that instant is genuinely outside the window, not a
+    // truncation bug — this is the "still excludes something" half of the
+    // fix, so the test can't pass by simply matching everything.
+    const cairoOffsetMs = getPlatformTimeZoneOffsetMs(
+      new Date("2026-09-01T00:00:00.000Z"),
+    );
+    const windowEndUtc = new Date(Date.UTC(2026, 8, 1) - cairoOffsetMs);
+    const justAfterWindowEnd = new Date(windowEndUtc.getTime() + 1);
+
+    await seedSubscription({
+      price: 299,
+      currentPeriodStart: new Date("2026-08-01T00:00:00.000Z"),
+      currentPeriodEnd: justAfterWindowEnd,
     });
 
     await expect(
@@ -606,11 +637,13 @@ describe("getTopPerformingRestaurants", () => {
   });
 
   /**
-   * CHARACTERISATION. Same calendar-day truncation as
-   * `getTotalPlatformRevenue`: the frontend sends "2026-08-31", which parses to
-   * midnight UTC, so the last day of every report window is missing.
+   * REGRESSION (was a DEFECT — the same calendar-day truncation as
+   * `getTotalPlatformRevenue`, fixed 2026-08-24). "2026-08-31" now means the
+   * whole Cairo calendar day, so an order placed on the afternoon of the
+   * last day of the window is included rather than falling after a
+   * UTC-midnight cutoff.
    */
-  it("CHARACTERISATION: a calendar-day endDate excludes orders placed later that day", async () => {
+  it("includes an order placed later on the final Cairo day of the window", async () => {
     const shop = await seedShop("Last Day");
     await seedOrder({
       shopId: shop._id,
@@ -620,6 +653,80 @@ describe("getTopPerformingRestaurants", () => {
 
     await expect(
       getTopPerformingRestaurants(5, "2026-08-01", "2026-08-31"),
-    ).resolves.toEqual([]);
+    ).resolves.toEqual([
+      { shopId: shop._id, shopName: "Last Day", totalShopRevenue: 500 },
+    ]);
+  });
+
+  /**
+   * The precise edge, computed from the real IANA offset rather than a
+   * hardcoded "+2" or "+3" assumption — Egypt observes DST (UTC+3
+   * roughly May-October, UTC+2 otherwise), so which literal UTC hour the
+   * Cairo day-boundary falls on shifts with the calendar, and a test that
+   * hardcodes one would start lying twice a year. `getPlatformTimeZoneOffsetMs`
+   * is the same primitive `report-date-window.ts` itself uses, so this pins
+   * the *contract* (half-open window in PLATFORM_TIMEZONE) rather than
+   * today's specific offset.
+   */
+  describe("Cairo day-boundary precision", () => {
+    it("includes an order 1ms before the Cairo day boundary and excludes one exactly on it", async () => {
+      const shop = await seedShop("Boundary Shop");
+
+      // Cairo midnight of 2026-09-01 — the exclusive close of the window
+      // requested as endDate "2026-08-31".
+      const cairoOffsetMs = getPlatformTimeZoneOffsetMs(
+        new Date("2026-09-01T00:00:00.000Z"),
+      );
+      const windowEndUtc = Date.UTC(2026, 8, 1) - cairoOffsetMs;
+
+      await seedOrder({
+        shopId: shop._id,
+        totalAmount: 111,
+        createdAt: new Date(windowEndUtc - 1),
+      });
+      await seedOrder({
+        shopId: shop._id,
+        totalAmount: 999,
+        createdAt: new Date(windowEndUtc),
+      });
+
+      await expect(
+        getTopPerformingRestaurants(5, "2026-08-01", "2026-08-31"),
+      ).resolves.toEqual([
+        { shopId: shop._id, shopName: "Boundary Shop", totalShopRevenue: 111 },
+      ]);
+    });
+
+    it("excludes an order exactly at the Cairo day-boundary start and includes one 1ms later", async () => {
+      const shop = await seedShop("Start Boundary Shop");
+
+      // Cairo midnight of 2026-08-01 — the inclusive open of the window
+      // requested as startDate "2026-08-01".
+      const cairoOffsetMs = getPlatformTimeZoneOffsetMs(
+        new Date("2026-08-01T00:00:00.000Z"),
+      );
+      const windowStartUtc = Date.UTC(2026, 7, 1) - cairoOffsetMs;
+
+      await seedOrder({
+        shopId: shop._id,
+        totalAmount: 222,
+        createdAt: new Date(windowStartUtc - 1),
+      });
+      await seedOrder({
+        shopId: shop._id,
+        totalAmount: 333,
+        createdAt: new Date(windowStartUtc),
+      });
+
+      await expect(
+        getTopPerformingRestaurants(5, "2026-08-01", "2026-08-31"),
+      ).resolves.toEqual([
+        {
+          shopId: shop._id,
+          shopName: "Start Boundary Shop",
+          totalShopRevenue: 333,
+        },
+      ]);
+    });
   });
 });

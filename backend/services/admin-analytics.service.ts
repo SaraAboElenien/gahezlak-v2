@@ -1,11 +1,15 @@
 import { FilterQuery, PipelineStage } from "mongoose";
 import { ISubscription, Subscriptions } from "../models/Subscription";
 import { Orders } from "../models/Order";
-import { Errors } from "../errors";
+import { parsePlatformDateWindow } from "../utils/report-date-window";
 
 /**
- * Turns the two raw query-string dates these endpoints receive into a window,
- * or into nothing at all when the caller did not ask for one.
+ * Turns the two raw query-string dates these endpoints receive into a
+ * half-open [start, end) window in PLATFORM_TIMEZONE, or into nothing at
+ * all when the caller did not ask for one. See
+ * `utils/report-date-window.ts` for the full reasoning — timezone,
+ * exclusive end, DST — this is a thin re-export so call sites below read
+ * naturally.
  *
  * `routes/admin.routes.ts` mounts all three analytics endpoints with **no
  * validator**, so both arguments are unvalidated user input and may be absent.
@@ -19,24 +23,7 @@ import { Errors } from "../errors";
  *   an internal schema path), while an aggregation swallows it into the same
  *   silent-empty result. A 400 is the honest answer to both.
  */
-function parseDateWindow(
-  startDate: string,
-  endDate: string,
-): { start: Date; end: Date } | null {
-  if (!startDate || !endDate) return null;
-
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-    throw new Errors.BadRequestError({
-      en: "startDate and endDate must be valid dates",
-      ar: "يجب أن يكون تاريخ البداية وتاريخ النهاية تاريخين صالحين",
-    });
-  }
-
-  return { start, end };
-}
+const parseDateWindow = parsePlatformDateWindow;
 
 // Total Revenue from Subscriptions
 export async function getTotalPlatformRevenue(
@@ -47,8 +34,14 @@ export async function getTotalPlatformRevenue(
 
   const dateWindow = parseDateWindow(startDate, endDate);
   if (dateWindow) {
+    // Containment semantics (start within window AND end within window) are
+    // a separate, already-known bug (see TECH_DEBT.md / the service test
+    // file) and are deliberately left exactly as-is here — only how the
+    // window's own boundaries are computed has changed. `end` is now the
+    // exclusive next-local-midnight instant from `parsePlatformDateWindow`,
+    // so the comparison is `$lt` rather than the old inclusive `$lte`.
     query.currentPeriodStart = { $gte: dateWindow.start };
-    query.currentPeriodEnd = { $lte: dateWindow.end };
+    query.currentPeriodEnd = { $lt: dateWindow.end };
   }
 
   const subscriptions = await Subscriptions.find(query).populate("plan");
@@ -90,7 +83,7 @@ export async function getTopPerformingRestaurants(
 
   const match: PipelineStage.Match["$match"] = { orderStatus: "Delivered" };
   if (dateWindow) {
-    match.createdAt = { $gte: dateWindow.start, $lte: dateWindow.end };
+    match.createdAt = { $gte: dateWindow.start, $lt: dateWindow.end };
   }
 
   const topShops = await Orders.aggregate([

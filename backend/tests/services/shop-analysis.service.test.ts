@@ -14,6 +14,7 @@ import {
   BestAndWorstSellers,
   totalRevenue,
 } from "../../services/shop-analysis.service";
+import { getPlatformTimeZoneOffsetMs } from "../../utils/report-date-window";
 
 /**
  * Everything a restaurant owner sees on their analytics tab comes out of this
@@ -363,6 +364,55 @@ describe("SalesComparison", () => {
   });
 
   /**
+   * REGRESSION for the calendar-day truncation bug (fixed 2026-08-24, see
+   * TECH_DEBT.md / DECISIONS.md). `july`/`august` above are exactly what the
+   * real controller builds — `new Date("2026-07-31")` etc — so an order
+   * placed later in the day on the last day of a window used to fall after
+   * the UTC-midnight `$lte` cutoff. The window is now computed in
+   * PLATFORM_TIMEZONE ("Africa/Cairo") from those Dates' UTC calendar date,
+   * so this is included.
+   */
+  it("includes an order placed later on the final Cairo day of the window", async () => {
+    await seedOrder({
+      totalAmount: 40,
+      createdAt: new Date("2026-07-31T13:00:00.000Z"),
+    });
+
+    await expect(
+      SalesComparison(SHOP_A.toString(), ...july, ...august),
+    ).resolves.toMatchObject({ total1: 40 });
+  });
+
+  /**
+   * The precise edge, derived from the real IANA offset rather than a
+   * hardcoded "+2"/"+3" assumption (Egypt observes DST roughly May-October).
+   * `getPlatformTimeZoneOffsetMs` is the same primitive the service itself
+   * uses, so this pins the half-open-window *contract*, not today's
+   * specific offset.
+   */
+  it("excludes an order exactly at the Cairo day-boundary close and includes one 1ms earlier", async () => {
+    // Cairo midnight of 2026-08-01 — the exclusive close of the window
+    // requested via `july`'s end Date ("2026-07-31").
+    const cairoOffsetMs = getPlatformTimeZoneOffsetMs(
+      new Date("2026-08-01T00:00:00.000Z"),
+    );
+    const windowEndUtc = Date.UTC(2026, 7, 1) - cairoOffsetMs;
+
+    await seedOrder({
+      totalAmount: 55,
+      createdAt: new Date(windowEndUtc - 1),
+    });
+    await seedOrder({
+      totalAmount: 999,
+      createdAt: new Date(windowEndUtc),
+    });
+
+    await expect(
+      SalesComparison(SHOP_A.toString(), ...july, ...august),
+    ).resolves.toMatchObject({ total1: 55 });
+  });
+
+  /**
    * CHARACTERISATION (see the report). `SalesComparison` applies **no status
    * filter**, so a cancelled order counts as a sale — while `totalRevenue()`
    * in this same file deliberately excludes Cancelled and Pending. The two
@@ -495,6 +545,75 @@ describe("BestAndWorstSellers", () => {
     ]);
   });
 
+  /**
+   * REGRESSION for the calendar-day truncation bug (fixed 2026-08-24, see
+   * TECH_DEBT.md / DECISIONS.md). The window is now half-open and computed
+   * in PLATFORM_TIMEZONE ("Africa/Cairo"), so a sale placed later in the day
+   * on the final day of the window is included rather than falling after a
+   * UTC-midnight `$lte` cutoff.
+   */
+  it("includes a sale placed later on the final Cairo day of the window", async () => {
+    const item = await seedMenuItem("End Of Month");
+    await seedOrder({
+      items: [{ menuItem: item.id, quantity: 6 }],
+      createdAt: new Date("2026-08-31T13:00:00.000Z"),
+    });
+
+    const result = await BestAndWorstSellers(
+      SHOP_A.toString(),
+      5,
+      "2026-08-01",
+      "2026-08-31",
+    );
+
+    expect(result.bestSellers).toEqual([
+      {
+        menuItemId: item.id,
+        name: { en: "End Of Month", ar: "End Of Month بالعربية" },
+        total: 6,
+      },
+    ]);
+  });
+
+  /**
+   * The precise edge, derived from the real IANA offset rather than a
+   * hardcoded "+2"/"+3" assumption (Egypt observes DST roughly May-October).
+   * `getPlatformTimeZoneOffsetMs` is the same primitive the service itself
+   * uses, so this pins the half-open-window *contract*, not today's
+   * specific offset.
+   */
+  it("excludes a sale exactly at the Cairo day-boundary close and includes one 1ms earlier", async () => {
+    const insideItem = await seedMenuItem("Just Inside");
+    const outsideItem = await seedMenuItem("Just Outside");
+
+    // Cairo midnight of 2026-09-01 — the exclusive close of the window
+    // requested as endDate "2026-08-31".
+    const cairoOffsetMs = getPlatformTimeZoneOffsetMs(
+      new Date("2026-09-01T00:00:00.000Z"),
+    );
+    const windowEndUtc = Date.UTC(2026, 8, 1) - cairoOffsetMs;
+
+    await seedOrder({
+      items: [{ menuItem: insideItem.id, quantity: 3 }],
+      createdAt: new Date(windowEndUtc - 1),
+    });
+    await seedOrder({
+      items: [{ menuItem: outsideItem.id, quantity: 9 }],
+      createdAt: new Date(windowEndUtc),
+    });
+
+    const result = await BestAndWorstSellers(
+      SHOP_A.toString(),
+      5,
+      "2026-08-01",
+      "2026-08-31",
+    );
+
+    expect(result.bestSellers.map((row) => row.name.en)).toEqual([
+      "Just Inside",
+    ]);
+  });
+
   it("ignores a half-specified window rather than filtering on an Invalid Date", async () => {
     const item = await seedMenuItem("Always");
     await seedOrder({
@@ -510,6 +629,17 @@ describe("BestAndWorstSellers", () => {
     );
 
     expect(result.bestSellers).toHaveLength(1);
+  });
+
+  it("rejects an unparseable date rather than silently matching nothing", async () => {
+    // `$match` inside an aggregation does no schema casting, so before the
+    // shared date-window helper this would have silently produced an empty
+    // report instead of a 400. The window parser throws before the
+    // try/catch that wraps the aggregations, so this must NOT surface as
+    // the generic "Failed to retrieve best and worst sellers" 422.
+    await expect(
+      BestAndWorstSellers(SHOP_A.toString(), 5, "not-a-date", "2026-08-31"),
+    ).rejects.toMatchObject({ statusCode: 400 });
   });
 
   it("honours the limit", async () => {

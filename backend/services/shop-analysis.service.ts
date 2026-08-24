@@ -1,6 +1,10 @@
 import mongoose, { FilterQuery } from "mongoose";
 import { IOrder, Orders, OrderStatus } from "../models/Order";
 import { Errors } from "../errors";
+import {
+  parsePlatformDateWindow,
+  platformDayWindowFromDates,
+} from "../utils/report-date-window";
 
 export async function CanceledOrderRate(shopId: string) {
   const totalOrders = await Orders.countDocuments({ shopId });
@@ -49,11 +53,20 @@ export async function SalesComparison(
   end2: Date,
 ) {
   const sumSales = async (start: Date, end: Date) => {
+    // `start`/`end` arrive here as Dates the controller already built from
+    // "YYYY-MM-DD" query strings via `new Date(...)`, which parses a
+    // date-only string as UTC midnight — so their UTC calendar date is
+    // exactly the calendar day that was typed. Re-derive a proper
+    // PLATFORM_TIMEZONE half-open window from that day rather than using
+    // the raw UTC-midnight instants directly, which is what used to cut the
+    // last day of the range off at its very start (00:00 UTC).
+    const window = platformDayWindowFromDates(start, end);
+
     const orders = await Orders.aggregate([
       {
         $match: {
           shopId: new mongoose.Types.ObjectId(shopId),
-          createdAt: { $gte: start, $lte: end },
+          createdAt: { $gte: window.start, $lt: window.end },
         },
       },
       { $group: { _id: null, total: { $sum: "$totalAmount" } } },
@@ -90,10 +103,14 @@ export async function BestAndWorstSellers(
   };
 
   if (startDate && endDate) {
-    matchQuery.createdAt = {
-      $gte: new Date(startDate),
-      $lte: new Date(endDate),
-    };
+    // Half-open, PLATFORM_TIMEZONE-aware window — see
+    // utils/report-date-window.ts. `startDate`/`endDate` are the raw
+    // "YYYY-MM-DD" query strings, so this goes through the string-based
+    // parser rather than the Date-based one `SalesComparison` above needs.
+    const window = parsePlatformDateWindow(startDate, endDate);
+    if (window) {
+      matchQuery.createdAt = { $gte: window.start, $lt: window.end };
+    }
   }
 
   // Helper function to create aggregation pipeline

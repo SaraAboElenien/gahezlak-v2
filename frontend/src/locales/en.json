@@ -1,4 +1,6 @@
 {
+  "gahez": "gahez",
+  "lak": "lak",
   "welcome": "Welcome !",
   "login": "Login",
   "navigation": "Navigation",
@@ -28,6 +30,7 @@
   "add category": "Add Category",
   "subscription": "Subscription",
   "Search categories...": "Search categories...",
+  "Upload Menu": "Upload Menu",
   "menu": {
     "title": "Menu Management",
     "description": "Manage your restaurant's categories and menu items",
@@ -79,6 +82,9 @@
         "category": "Category",
         "prepTime": "Preparation Time (minutes)",
         "imageUrl": "Image URL",
+        "image": "Item Image",
+        "uploadImage": "Click to upload image",
+        "imageHint": "Recommended size: 500x500px",
         "available": "Available",
         "discountSettings": "Discount Settings",
         "enableDiscount": "Enable Discount",
@@ -122,7 +128,8 @@
         "cancel": "Cancel",
         "add": "Add",
         "update": "Update",
-        "saving": "Saving..."
+        "saving": "Saving...",
+        "optionsNeedChoices": "Every option group needs at least one choice"
       }
     },
     "cards": {
@@ -163,7 +170,21 @@
       "Selected Files": "Selected Files",
       "Upload files": "Upload files",
       "uploading": "Uploading..."
-    }
+    },
+    "uploadSuccess": "Menu uploaded and analysed successfully!",
+    "enrichTitle": "Allergen & dietary analysis",
+    "enrichDescription": "Analyse every dish for allergens, ingredients and dietary tags so customers can search your menu by their restrictions. Run this after adding or editing items — dishes that have not been analysed are hidden from allergy searches.",
+    "enrichRun": "Analyse menu",
+    "enrichRunning": "Analysing…",
+    "enrichForce": "Re-analyse all",
+    "enrichForceHint": "Re-analyse every dish, including ones already done. Use after editing descriptions.",
+    "enrichProgress": "Analysed {{done}} so far, {{remaining}} to go…",
+    "enrichPatience": "This analyses each dish separately and can take a minute or two on a large menu. Leave this page open.",
+    "enrichProcessed": "{{count}} analysed",
+    "enrichSkipped": "{{count}} already done",
+    "enrichFailed": "{{count}} failed",
+    "enrichSuccess": "Analysed {{count}} menu items.",
+    "enrichNothingToDo": "Every menu item has already been analysed."
   },
   "settings": {
     "title": "Settings",
@@ -622,7 +643,9 @@
       "subscribe": "Subscribe",
       "poweredBy": "Powered by Gahezlak • Terms • Privacy",
       "success": "Subscription activated successfully!",
-      "failed": "Subscription failed. Please try again."
+      "failed": "Subscription failed. Please try again.",
+      "userNotLoggedIn": "Please log in to subscribe.",
+      "alreadySubscribed": "You already have an active subscription."
     },
     "subscriptionCancelled": {
       "title": "Subscription Expired",
@@ -916,6 +939,8 @@
   "publicMenu": {
     "menu": "Menu",
     "favourites": "Saved",
+    "addToFavourites": "Add to favourites",
+    "removeFromFavourites": "Remove from favourites",
     "cart": "Cart",
     "trackOrder": "Track Order",
     "home": "Home",

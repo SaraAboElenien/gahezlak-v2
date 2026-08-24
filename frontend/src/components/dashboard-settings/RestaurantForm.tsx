@@ -197,7 +197,7 @@ export const RestaurantForm = ({
               id="restaurant-email"
               type="email"
               icon={<Mail className="text-gray-700 w-4 h-4" />}
-              placeholder={t("settings.restaurantInfo.placeholders.email")}
+              placeholder={t("settings.placeholders.email")}
               register={register("email")}
               error={errors.email}
               errorMessage={errors.email?.message}
@@ -209,7 +209,7 @@ export const RestaurantForm = ({
               id="restaurant-phone"
               type="tel"
               icon={<Phone className="text-gray-700 w-4 h-4" />}
-              placeholder={t("settings.restaurantInfo.placeholders.phone")}
+              placeholder={t("settings.placeholders.phone")}
               register={register("phoneNumber")}
               error={errors.phoneNumber}
               errorMessage={errors.phoneNumber?.message}

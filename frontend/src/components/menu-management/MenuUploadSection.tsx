@@ -97,7 +97,7 @@ const MenuUploadSection = ({ onComplete }: MenuUploadSectionProps) => {
         <div className="flex flex-col items-center justify-center gap-4">
           <Upload className="w-12 h-12 text-gray-400" />
           <p className="text-gray-600 dark:text-gray-400">
-            {t("Drag & drop files here, or click to browse")}
+            {t("menu.upload.Drag & drop files here, or click to browse")}
           </p>
           <input
             type="file"
@@ -121,7 +121,7 @@ const MenuUploadSection = ({ onComplete }: MenuUploadSectionProps) => {
       {files.length > 0 && (
         <div className="mt-8">
           <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
-            {t("upload.Selected Files")} ({files.length})
+            {t("menu.upload.Selected Files")} ({files.length})
           </h3>
           <div className="space-y-3">
             {files.map((file, index) => (
@@ -161,8 +161,8 @@ const MenuUploadSection = ({ onComplete }: MenuUploadSectionProps) => {
               className="bg-primary hover:bg-darker-primary text-white px-6 py-3 rounded-lg font-medium flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {uploadMenuUsingOCRLoading
-                ? t("upload.uploading")
-                : t("upload.Upload files")}
+                ? t("menu.upload.uploading")
+                : t("menu.upload.Upload files")}
             </button>
           </div>
         </div>

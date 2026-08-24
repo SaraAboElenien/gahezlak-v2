@@ -18,7 +18,9 @@
     "seed:plans:dev": "set NODE_ENV=development&& tsx --env-file=.env utils/seed-plans.ts",
     "seed:plans:prod": "set NODE_ENV=production&& tsx --env-file=.env.prod utils/seed-plans.ts",
     "seed:menu:dev": "set NODE_ENV=development&& tsx --env-file=.env utils/seed-menu.ts",
-    "seed:menu:prod": "set NODE_ENV=production&& tsx --env-file=.env.prod utils/seed-menu.ts"
+    "seed:menu:prod": "set NODE_ENV=production&& tsx --env-file=.env.prod utils/seed-menu.ts",
+    "migrate:report-phones:dev": "set NODE_ENV=development&& tsx --env-file=.env utils/migrate-report-phone-numbers.ts",
+    "migrate:report-phones:prod": "set NODE_ENV=production&& tsx --env-file=.env.prod utils/migrate-report-phone-numbers.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",

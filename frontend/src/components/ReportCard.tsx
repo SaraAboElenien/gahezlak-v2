@@ -6,7 +6,10 @@ type Report = {
   senderEmail: string;
   receiver: string;
   message: string;
-  phoneNumber?: number;
+  // String, not number: Report.phoneNumber is a phone number, and storing it
+  // as a Number silently ate the leading zero of every Egyptian mobile until
+  // 2026-08-24. See models/Report.ts and TECH_DEBT.md.
+  phoneNumber?: string;
   shopName?: string;
   createdAt: string;
 };

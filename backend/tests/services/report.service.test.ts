@@ -229,7 +229,7 @@ describe("createShopReport", () => {
     expect(await Report.countDocuments({ shopId: SHOP_B })).toBe(0);
   });
 
-  it("stores the customer's phone number as a number, losing its leading zero", async () => {
+  it("stores the customer's phone number as a string, keeping its leading zero", async () => {
     const { createShopReport } = await reportService();
     await seedShop("Alpha", SHOP_A);
     await seedOrder({ customerPhoneNumber: "01012345678" });
@@ -239,27 +239,25 @@ describe("createShopReport", () => {
       shopReportInput({ phoneNumber: "01012345678" }),
     );
 
-    // CURRENT BEHAVIOUR, not desired behaviour, and this one is live rather
-    // than latent. `models/Report.ts` types `phoneNumber` as Number while
+    // FIXED 2026-08-24. This test used to pin the bug it now guards against:
+    // `models/Report.ts` typed `phoneNumber` as Number while
     // `models/Order.ts` types `customerPhoneNumber` as String, and the
     // frontend's own review form (`reviewFormSchema.ts`) mandates the
-    // Egyptian `01…` format. The order *lookup* above matches, because
-    // Mongoose casts the submitted string back to a string for that query —
-    // but the value written into the report is cast to a Number, and
-    // `Number("01012345678")` is 1012345678. The shop owner's dashboard shows
-    // a ten-digit number that cannot be dialled, on the one field whose
-    // entire purpose is calling the complaining customer back.
-    //
-    // Reported rather than fixed: the fix is a schema type change plus a
-    // migration for reports already stored this way, and the frontend's
-    // `types/report.ts` declares it a number too. Do not "fix" this by
-    // changing these assertions.
-    expect(report.phoneNumber).toBe(1012345678);
+    // Egyptian `01…` format. Mongoose cast the submitted string on write, so
+    // `Number("01012345678")` — 1012345678 — is what used to land in the
+    // database, and the assertions here used to require exactly that value.
+    // Do NOT revert `report.phoneNumber` back to a `toBe(1012345678)`-style
+    // assertion — that would restore the bug and pin it a second time. The
+    // schema is now String (see the comment on `phoneNumber` in
+    // models/Report.ts) and rows written under the old Number schema are
+    // repaired by utils/migrate-report-phone-numbers.ts.
+    expect(report.phoneNumber).toBe("01012345678");
 
     const stored = await Report.findById(
       (report as { _id: Types.ObjectId })._id,
     ).lean();
-    expect(stored?.phoneNumber).toBe(1012345678);
+    expect(stored?.phoneNumber).toBe("01012345678");
+    expect(typeof stored?.phoneNumber).toBe("string");
   });
 });
 
@@ -402,14 +400,14 @@ describe("getAllShopReports", () => {
       receiver: Role.SHOP_OWNER,
       shopId: SHOP_A,
       message: "Older complaint here.",
-      phoneNumber: 1012345678,
+      phoneNumber: "01012345678",
     });
     await backdate(older._id as Types.ObjectId, new Date("2026-01-01"));
     const newer = await Report.create({
       receiver: Role.SHOP_OWNER,
       shopId: SHOP_A,
       message: "Newer complaint here.",
-      phoneNumber: 1012345678,
+      phoneNumber: "01012345678",
     });
     await backdate(newer._id as Types.ObjectId, new Date("2026-06-01"));
 
@@ -427,13 +425,13 @@ describe("getAllShopReports", () => {
       receiver: Role.SHOP_OWNER,
       shopId: SHOP_A,
       message: "Alpha's complaint.",
-      phoneNumber: 1012345678,
+      phoneNumber: "01012345678",
     });
     await Report.create({
       receiver: Role.SHOP_OWNER,
       shopId: SHOP_B,
       message: "Beta's complaint.",
-      phoneNumber: 1012345678,
+      phoneNumber: "01012345678",
     });
 
     // `new ObjectId(undefined)` mints a *fresh* id rather than producing an

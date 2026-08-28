@@ -18,8 +18,8 @@ import { Roles, Role } from "../../models/Role";
 import { clearTestDB } from "../db-test-helper";
 
 /**
- * Service-level coverage for the shop service: shop creation and lookup, the
- * member roster, and QR-code regeneration.
+ * Service-level coverage for the shop service: shop creation and lookup, and
+ * the member roster.
  *
  * The roster half is the sharp end. `removeMemberFromShop` does not merely
  * un-list somebody — it *deletes their user account*, and `registerShopMember`
@@ -35,17 +35,12 @@ import { clearTestDB } from "../db-test-helper";
  * response — a control that no feature would break if it were deleted.
  *
  * Deliberately NOT mocked: bcrypt and Mongo, so hashing and persistence are
- * the real thing. Only the QR-code/imgbb boundary is stubbed.
+ * the real thing. As of 2026-08-24 `createShop` no longer touches QR
+ * generation or imgbb at all — both are gone from this service (see
+ * `tests/utils/qr-code-generator.test.ts` and
+ * `tests/routes/shop-qr-code.routes.test.ts` for that coverage now) — so
+ * there is nothing left in this file that needs stubbing.
  */
-
-// The real helper renders a PNG and uploads it to imgbb over the network on a
-// paid API key. Stubbing it is what makes "no upload happens for a shop that
-// does not exist" an assertion worth writing rather than a description of a
-// mock.
-const generateQRCodeMock = vi.hoisted(() => vi.fn());
-vi.mock("../../utils/qr-code-generator", () => ({
-  generateAndUploadMenuQRCode: generateQRCodeMock,
-}));
 
 /**
  * `removeMemberFromShop` wraps its two writes in `session.withTransaction`,
@@ -183,10 +178,6 @@ afterAll(async () => {
 beforeEach(async () => {
   await clearTestDB();
   vi.clearAllMocks();
-  generateQRCodeMock.mockResolvedValue({
-    qrCodeUrl: "https://i.ibb.co/qr.png",
-    menuUrl: "http://localhost:5173/shops/Test%20Bistro/menu",
-  });
   const [staff, manager, admin] = await Roles.create([
     { name: Role.SHOP_STAFF, permissions: [] },
     { name: Role.SHOP_MANAGER, permissions: [] },
@@ -200,6 +191,26 @@ beforeEach(async () => {
 });
 
 describe("createShop", () => {
+  /**
+   * The whole reason this change exists: imgbb started refusing requests
+   * from the deployed host's datacenter IP range for the QR-upload path,
+   * which meant `POST /shops` — shop creation itself — was completely broken
+   * in production. QR generation is now local and on-demand (see
+   * `utils/qr-code-generator.ts` and `getShopQrCodeHandler`), so `createShop`
+   * should be able to complete with zero network calls when no logo is
+   * uploaded (a logo file still goes through imgbb via `uploadToImgbb`, which
+   * is out of scope here and untouched).
+   */
+  it("makes no network call", async () => {
+    const { createShop } = await shopService();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    await createShop(shopInput(), OWNER_A.toString());
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
+
   it("records the caller as owner and ignores an ownerId in the payload", async () => {
     const { createShop } = await shopService();
 
@@ -256,16 +267,12 @@ describe("createShop", () => {
     expect(await Shops.countDocuments({})).toBe(1);
   });
 
-  it("stores the address and the QR code URL it was handed", async () => {
+  it("stores the address it was handed", async () => {
     const { createShop } = await shopService();
 
-    const created = await createShop(
-      shopInput({ qrCodeUrl: "https://i.ibb.co/qr.png" }),
-      OWNER_A.toString(),
-    );
+    const created = await createShop(shopInput(), OWNER_A.toString());
 
     expect(created.address).toMatchObject({ city: "Cairo" });
-    expect(created.qrCodeUrl).toBe("https://i.ibb.co/qr.png");
     expect(created.subscriptionId).toBeNull();
   });
 
@@ -273,16 +280,15 @@ describe("createShop", () => {
    * MASS-ASSIGNMENT REGRESSION (closed 2026-08-24) — the permissive half.
    *
    * `createShop`'s parameter was typed `Pick<IShop, "name"|"type"|"address"|
-   * "phoneNumber"|"email"|"qrCodeUrl"|"logoUrl">`, but that is a
-   * compile-time constraint only: `createShopHandler` builds the object it
-   * actually passes as `{ ...req.body, qrCodeUrl, logoUrl }`, and
-   * `Shops.create({ ...shopData, ownerId })` spread it straight into the
-   * write with nothing stripping fields the type didn't name. Following the
-   * lesson from the `updateShop` regression above — an allowlist that is
-   * never tested in its permissive direction can silently drop a legitimate
-   * field while still returning 200 — this asserts every field the
-   * shop-creation form actually submits, plus the two the controller derives
-   * itself, all round-trip together.
+   * "phoneNumber"|"email"|"logoUrl">`, but that is a compile-time constraint
+   * only: `createShopHandler` builds the object it actually passes as
+   * `{ ...req.body, logoUrl }`, and `Shops.create({ ...shopData, ownerId })`
+   * spread it straight into the write with nothing stripping fields the type
+   * didn't name. Following the lesson from the `updateShop` regression above
+   * — an allowlist that is never tested in its permissive direction can
+   * silently drop a legitimate field while still returning 200 — this
+   * asserts every field the shop-creation form actually submits, plus the
+   * one the controller derives itself, all round-trip together.
    */
   it("persists every field an ordinary shop-creation form submits", async () => {
     const { createShop } = await shopService();
@@ -294,7 +300,6 @@ describe("createShop", () => {
         address: { country: "EG", city: "Giza", street: "9 Nile St" },
         phoneNumber: "01055555555",
         email: "roundtrip@example.com",
-        qrCodeUrl: "https://i.ibb.co/qr.png",
         logoUrl: "https://i.ibb.co/logo.png",
       }),
       OWNER_A.toString(),
@@ -305,7 +310,6 @@ describe("createShop", () => {
     expect(created.address).toMatchObject({ city: "Giza" });
     expect(created.phoneNumber).toBe("01055555555");
     expect(created.email).toBe("roundtrip@example.com");
-    expect(created.qrCodeUrl).toBe("https://i.ibb.co/qr.png");
     expect(created.logoUrl).toBe("https://i.ibb.co/logo.png");
 
     // Read back from the database rather than trusting the returned
@@ -353,6 +357,32 @@ describe("createShop", () => {
     expect(
       (stored as unknown as { isPaymentDone?: boolean } | null)?.isPaymentDone,
     ).toBeUndefined();
+  });
+
+  /**
+   * `qrCodeUrl` (closed 2026-08-24, alongside removing imgbb from the QR
+   * path entirely). It used to be one of the fields `createShopHandler`
+   * derived and passed in itself — a freshly generated, imgbb-hosted image
+   * URL — which is exactly why it had to be in `CREATABLE_SHOP_FIELDS` at
+   * all: the field existed for the *controller* to set, not the client. Now
+   * that QR generation happens on demand (`GET
+   * /shops/name/:shopName/qr-code.png`), nothing derives a value for this
+   * field any more, and it is no longer in the allowlist — so a client that
+   * still sends it (an old cached frontend bundle, a direct API call) must
+   * not have it stored, the same way `subscriptionId`/`isPaymentDone` above
+   * must not.
+   */
+  it("does not let the create body set qrCodeUrl", async () => {
+    const { createShop } = await shopService();
+
+    const created = await createShop(
+      shopInput({ qrCodeUrl: "https://i.ibb.co/attacker-supplied.png" }),
+      OWNER_A.toString(),
+    );
+
+    expect(created.qrCodeUrl).toBeUndefined();
+    const stored = await Shops.findById(created._id).lean();
+    expect(stored?.qrCodeUrl).toBeUndefined();
   });
 });
 
@@ -698,44 +728,10 @@ describe("getAllShops", () => {
   });
 });
 
-describe("regenerateShopQRCode", () => {
-  it("stores the freshly uploaded URL on the shop", async () => {
-    const { regenerateShopQRCode } = await shopService();
-    const shop = await seedShop();
-    generateQRCodeMock.mockResolvedValue({
-      qrCodeUrl: "https://i.ibb.co/new-qr.png",
-      menuUrl: `http://localhost:5173/shops/${shop.name}/menu`,
-    });
-
-    const result = await regenerateShopQRCode(shop._id.toString());
-
-    // The stored URL is what the owner prints onto table cards; returning the
-    // new one without persisting it would give them a code the shop record
-    // does not know about.
-    expect(result.qrCodeUrl).toBe("https://i.ibb.co/new-qr.png");
-    expect((await Shops.findById(shop._id).lean())?.qrCodeUrl).toBe(
-      "https://i.ibb.co/new-qr.png",
-    );
-    expect(generateQRCodeMock).toHaveBeenCalledWith(
-      shop.name,
-      undefined,
-      expect.any(Object),
-    );
-  });
-
-  it("does not generate or upload anything for a shop that does not exist", async () => {
-    const { regenerateShopQRCode } = await shopService();
-
-    await expect(
-      regenerateShopQRCode(new mongoose.Types.ObjectId().toString()),
-    ).rejects.toThrow("Shop not found");
-
-    // Ordering matters twice over: the upload is a paid third-party call, and
-    // the caller must be told the shop is missing rather than that an image
-    // upload failed.
-    expect(generateQRCodeMock).not.toHaveBeenCalled();
-  });
-});
+// `regenerateShopQRCode` (closed 2026-08-24) is gone along with
+// `POST /shops/qr-code` — QR generation is on demand now, so there is no
+// stored image to regenerate. See tests/routes/shop-qr-code.routes.test.ts
+// for the coverage that replaced this describe block.
 
 describe("getShopMembers", () => {
   it("returns this shop's roster with each member's user and role expanded", async () => {

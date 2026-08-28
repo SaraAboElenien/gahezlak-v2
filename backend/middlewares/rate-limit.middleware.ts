@@ -69,3 +69,24 @@ export const otpRateLimiter = rateLimit({
     );
   },
 });
+
+// The public per-shop QR code PNG (`GET /shops/name/:shopName/qr-code.png`).
+// Unauthenticated by design — the dashboard's <img> tag has no session to
+// spend, and the image is meant to be directly linkable — so, like the AI
+// search route above, there is no auth gate to lean on and this limiter is
+// the entire defence. Each request costs a real DB lookup plus a PNG encode
+// rather than third-party money, so the limit is looser than the AI one but
+// still bounded: generous enough for a dashboard re-rendering its settings
+// page repeatedly, tight enough that hammering the endpoint can't turn a free
+// CPU/DB cost into a denial-of-service knob.
+export const qrCodeRateLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: new MongoRateLimitStore("qr-code"),
+  passOnStoreError: true,
+  handler: (req, res, next) => {
+    next(new Errors.TooManyRequestsError(errMsg.TOO_MANY_REQUESTS, req.lang));
+  },
+});

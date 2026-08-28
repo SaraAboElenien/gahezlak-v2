@@ -32,7 +32,6 @@ export interface Shop {
   email: string;
   ownerId: string;
   subscriptionId: string | null;
-  qrCodeImage?: string;
   logoUrl?: string;
   members: ShopMember[];
   isPaymentDone: boolean;
@@ -50,7 +49,6 @@ export interface PublicShop {
     city: string;
     street: string;
   };
-  qrCodeUrl: string;
   logoUrl: string;
 }
 export interface PublicShopResponse {

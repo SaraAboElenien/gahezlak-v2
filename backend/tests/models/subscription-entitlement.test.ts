@@ -10,6 +10,7 @@ import {
   SubscriptionStatus,
   isEntitledToService,
   entitledToServiceFilter,
+  ACTIVE_GRACE_PERIOD_MS,
 } from "../../models/Subscription";
 
 /**
@@ -27,6 +28,8 @@ import {
 const DAY = 24 * 60 * 60 * 1000;
 const future = () => new Date(Date.now() + 10 * DAY);
 const past = () => new Date(Date.now() - DAY);
+/** Comfortably outside ACTIVE_GRACE_PERIOD_MS, whatever it is set to. */
+const longPast = () => new Date(Date.now() - ACTIVE_GRACE_PERIOD_MS - 10 * DAY);
 
 describe("isEntitledToService", () => {
   it.each([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING])(
@@ -68,6 +71,10 @@ describe("isEntitledToService", () => {
    *
    * Do NOT "fix" a failure here by relaxing the assertion — that restores an
    * unlimited free tier.
+   *
+   * This also pins the asymmetry with ACTIVE below: `past()` is one day ago,
+   * which is *inside* ACTIVE_GRACE_PERIOD_MS. If the grace window were ever
+   * extended to TRIALING, this test fails.
    */
   it("refuses a trial whose period has ended", () => {
     expect(
@@ -79,12 +86,67 @@ describe("isEntitledToService", () => {
   });
 
   it("refuses a cancelled subscription past its paid period", () => {
+    // Same asymmetry guard as the trial case above: one day past, which the
+    // ACTIVE grace window would still admit. Cancellation dates are known in
+    // advance and nothing external moves them, so they get no grace.
     expect(
       isEntitledToService({
         status: SubscriptionStatus.CANCELLED,
         currentPeriodEnd: past(),
       }),
     ).toBe(false);
+  });
+
+  /**
+   * The bug these pin, and why the ACTIVE branch is graced rather than hard.
+   *
+   * ACTIVE used to return `true` unconditionally — the same shape as the
+   * TRIALING bug above. A subscription whose payment quietly stopped kept full
+   * access forever, because nothing in this codebase re-examines the clock and
+   * there is no scheduler of any kind.
+   *
+   * It is graced because `currentPeriodEnd` is advanced for ACTIVE rows by an
+   * *external* event, Paymob's renewal webhook, and three paths in that
+   * handler return early after the customer has already been charged. Both
+   * directions are asserted: this project once shipped an allowlist that was
+   * only tested in the deny direction and silently stripped two fields from
+   * every shop update while still returning 200.
+   */
+  it("admits an active subscription inside the grace window after its period", () => {
+    expect(
+      isEntitledToService({
+        status: SubscriptionStatus.ACTIVE,
+        currentPeriodEnd: new Date(Date.now() - ACTIVE_GRACE_PERIOD_MS / 2),
+      }),
+    ).toBe(true);
+  });
+
+  it("refuses an active subscription once the grace window has passed", () => {
+    expect(
+      isEntitledToService({
+        status: SubscriptionStatus.ACTIVE,
+        currentPeriodEnd: longPast(),
+      }),
+    ).toBe(false);
+  });
+
+  it("puts the active cutoff exactly one grace period behind now", () => {
+    // Pins the boundary itself, so widening or narrowing the window is a
+    // deliberate edit to ACTIVE_GRACE_PERIOD_MS rather than an accident in the
+    // comparison. `now` is injected so this cannot flake on a slow machine.
+    const now = new Date("2026-08-28T12:00:00.000Z");
+    const cutoff = new Date(now.getTime() - ACTIVE_GRACE_PERIOD_MS);
+
+    const check = (currentPeriodEnd: Date) =>
+      isEntitledToService(
+        { status: SubscriptionStatus.ACTIVE, currentPeriodEnd },
+        now,
+      );
+
+    expect(check(new Date(cutoff.getTime() + 1000))).toBe(true);
+    // Strictly greater than, matching the `$gt` the Mongo filter uses.
+    expect(check(cutoff)).toBe(false);
+    expect(check(new Date(cutoff.getTime() - 1000))).toBe(false);
   });
 
   it("refuses a pending subscription even with time on the clock", () => {
@@ -135,12 +197,21 @@ describe("entitledToServiceFilter agrees with isEntitledToService", () => {
   });
 
   it("selects exactly the rows the predicate admits", async () => {
-    // `shop` is `unique: true` on the model, so these six rows cannot share
-    // one shop the way this fixture originally had them — that combination is
+    // `shop` is `unique: true` on the model, so these rows cannot share one
+    // shop the way this fixture originally had them — that combination is
     // unrepresentable in production. Each row gets its own shop and the query
     // is scoped by the created ids instead.
     const rows = [
       { status: SubscriptionStatus.ACTIVE, currentPeriodEnd: future() },
+      // The two ACTIVE clock cases. The grace window is the one place these
+      // encodings could drift apart silently, because only the predicate can
+      // express it as arithmetic on the period end — the filter has to shift
+      // the cutoff instead, and those are only equal algebraically.
+      {
+        status: SubscriptionStatus.ACTIVE,
+        currentPeriodEnd: new Date(Date.now() - ACTIVE_GRACE_PERIOD_MS / 2),
+      },
+      { status: SubscriptionStatus.ACTIVE, currentPeriodEnd: longPast() },
       { status: SubscriptionStatus.TRIALING, currentPeriodEnd: future() },
       // The expired trial: absent from this table, the two encodings could
       // disagree about it and no test would notice.
@@ -177,6 +248,8 @@ describe("entitledToServiceFilter agrees with isEntitledToService", () => {
     }
     // Sanity: the fixture set has to contain both answers, or the loop above
     // passes trivially against a filter that matches everything or nothing.
-    expect(matchedIds.size).toBe(3);
+    // Entitled: ACTIVE/future, ACTIVE/inside-grace, TRIALING/future,
+    // CANCELLED/future.
+    expect(matchedIds.size).toBe(4);
   });
 });

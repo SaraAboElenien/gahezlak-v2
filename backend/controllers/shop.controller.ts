@@ -4,11 +4,8 @@ import { IShop } from "../models/Shop";
 import { SuccessResponse } from "../common/types/controller-response.types";
 import { Users } from "../models/User";
 import { Types } from "mongoose";
-import {
-  generateAndUploadMenuQRCode,
-  QRCodeOptions,
-} from "../utils/qr-code-generator";
-import uploadToImgbb from "../utils/upload-to-imgbb";
+import { generateMenuQRCodeBuffer } from "../utils/qr-code-generator";
+import { uploadImage } from "../utils/upload-image";
 import { Role, Roles } from "../models/Role";
 import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
@@ -29,19 +26,22 @@ export const createShopHandler: RequestHandler<
   SuccessResponse<IShop>,
   Pick<IShop, "name" | "type" | "address" | "phoneNumber" | "email">
 > = async (req, res) => {
-  const { name } = req.body;
   const { userId } = requireUser(req);
-
-  // Generate and upload QR code for the new shop
-  const qrCodeResult = await generateAndUploadMenuQRCode(name);
 
   // Upload logo image to imgbb (if provided)
   let logoUrl;
   if (req.file) {
-    const imgbbResponse = await uploadToImgbb(req.file);
-    logoUrl = imgbbResponse?.data?.url;
+    const uploaded = await uploadImage(req.file);
+    logoUrl = uploaded.url;
   }
 
+  // No QR code is generated here any more — it used to be rendered once and
+  // uploaded to imgbb, which both baked the encoded URL in at this one moment
+  // and depended on an imgbb call that started failing for every deployed
+  // request. `GET /shops/name/:shopName/qr-code.png` renders it on demand
+  // from the shop's current name instead, so shop creation no longer needs
+  // network access to imgbb at all.
+  //
   // Create the shop. `payload`'s type is a compile-time constraint only —
   // `...req.body` is whatever JSON the client actually sent, which could
   // carry fields like `subscriptionId`/`isPaymentDone` this type doesn't
@@ -50,7 +50,6 @@ export const createShopHandler: RequestHandler<
   // looking otherwise.
   const payload: Parameters<typeof ShopService.createShop>[0] = {
     ...req.body,
-    qrCodeUrl: qrCodeResult.qrCodeUrl,
     logoUrl,
   };
 
@@ -89,8 +88,8 @@ export const updateShopHandler: RequestHandler<
 
   let logoUrl;
   if (req.file) {
-    const imgbbResponse = await uploadToImgbb(req.file);
-    logoUrl = imgbbResponse?.data?.url;
+    const uploaded = await uploadImage(req.file);
+    logoUrl = uploaded.url;
   }
 
   const shop = await ShopService.updateShop(req.params.shopId, {
@@ -169,42 +168,47 @@ export const getPublicShopListHandler: RequestHandler<
 };
 
 /**
- * Regenerate QR code for shop
+ * Public per-shop QR code image, generated on demand.
+ *
+ * There is no "regenerate" endpoint any more (removed — it used to render a
+ * PNG, upload it to imgbb, and store the returned URL on the shop). Once
+ * generation is on demand, "regenerate" is not a meaningful operation: this
+ * same handler renders the current PNG on every call, so it is always already
+ * current. It replaces both the old create-time generation and the old
+ * `POST /shops/qr-code` regeneration in one endpoint.
+ *
+ * Unauthenticated on purpose — the dashboard's <img> tag has no reason to
+ * carry a bearer token to fetch its own QR code, and the image is meant to be
+ * directly linkable (a print shop, a shared link) the same way the old imgbb
+ * URL was. `qrCodeRateLimiter` (router-level, see shop.routes.ts) is what
+ * keeps that safe: every request here does a real DB lookup plus a PNG
+ * encode, so it is not free to call even though it costs no third-party
+ * money.
  */
-export const regenerateQRCodeHandler: RequestHandler<
-  Empty,
-  SuccessResponse<{ qrCodeUrl: string; menuUrl: string }>,
-  Pick<QRCodeOptions, "width" | "margin" | "errorCorrectionLevel">
+export const getShopQrCodeHandler: RequestHandler<
+  { shopName: string },
+  Buffer,
+  unknown
 > = async (req, res) => {
-  const { userId } = requireUser(req);
-  const user = await Users.findById(userId);
-  if (!user || !user.shop) {
-    throw new Errors.NotFoundError(errMsg.USER_HAS_NO_SHOP);
-  }
+  const shop = await ShopService.getShop({ shopName: req.params.shopName });
 
-  // `validateRegenerateQRCode` bounds these at the TOP level of the body
-  // (width 100-1000, margin 0-10, errorCorrectionLevel L/M/Q/H). This handler
-  // used to read `req.body.options` instead, which meant the two never met:
-  // a validated `{ width }` was silently discarded, while an unvalidated
-  // `{ options: { width: 100000 } }` skipped the bounds entirely and reached
-  // QRCode.toBuffer, allocating a 100000x100000 bitmap on an authenticated
-  // request. Reading the validated fields is what closes both halves.
-  const { width, margin, errorCorrectionLevel } = req.body;
-  const options: QRCodeOptions = {};
-  if (width !== undefined) options.width = width;
-  if (margin !== undefined) options.margin = margin;
-  if (errorCorrectionLevel !== undefined)
-    options.errorCorrectionLevel = errorCorrectionLevel;
+  const { buffer } = await generateMenuQRCodeBuffer(shop.name);
 
-  const result = await ShopService.regenerateShopQRCode(
-    user.shop.toString(),
-    options,
+  // Deliberately not cached indefinitely: the image is a pure function of the
+  // shop's *current* name and FRONTEND_URL, and both can change (a rename, an
+  // origin change) — the entire reason this endpoint exists instead of a
+  // stored URL is so that change is picked up automatically. `max-age=0`
+  // forces a browser to revalidate rather than hold its own copy forever;
+  // `s-maxage=3600` still lets a shared/CDN cache absorb repeat hits for an
+  // hour without making a stale image durable, which matters given the route
+  // is public and rate-limited rather than free. Mirrors
+  // getPublicShopListHandler's choice above for the same reason.
+  res.setHeader(
+    "Cache-Control",
+    "public, max-age=0, s-maxage=3600, stale-while-revalidate=86400",
   );
-
-  res.status(200).json({
-    message: "QR code regenerated successfully",
-    data: result,
-  });
+  res.setHeader("Content-Type", "image/png");
+  res.status(200).send(buffer);
 };
 
 // Cancel shop subscription

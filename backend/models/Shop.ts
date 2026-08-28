@@ -20,7 +20,19 @@ export interface IShop {
   ownerId: Types.ObjectId;
   members: IShopMember[];
   isPaymentDone: boolean;
-  qrCodeUrl?: string; // imgbb QR code image URL
+  // Legacy only, as of 2026-08-24: the old imgbb-hosted QR flow wrote this;
+  // nothing writes or reads it any more. The QR image is now generated on
+  // demand from the shop's *current* name — see
+  // `GET /shops/name/:shopName/qr-code.png` and `utils/qr-code-generator.ts`.
+  //
+  // RETAINED DELIBERATELY — do not delete. Shop documents created before that
+  // change still carry the field in the production database. Dropping it from
+  // the schema would not remove those values; it would only make them
+  // invisible to Mongoose (strict mode hides undeclared paths from reads and
+  // silently ignores them in writes), so they could no longer be inspected or
+  // cleaned up through the model. It stays declared until a migration has
+  // actually unset it on the old rows.
+  qrCodeUrl?: string;
   logoUrl?: string; // imgbb restaurant logo image URL
   subscriptionId: Types.ObjectId | null;
   createdAt: Date;
@@ -48,7 +60,7 @@ const ShopSchema = new Schema<IShop>(
       ref: collectionsName.SUBSCRIPTIONS,
       default: null,
     },
-    qrCodeUrl: { type: String }, // imgbb QR code image URL
+    qrCodeUrl: { type: String }, // legacy only — see the interface comment above
     logoUrl: { type: String }, // imgbb restaurant logo image URL   logoDeleteUrl: { type: String }, // imgbb delete url for logo
     members: {
       type: [

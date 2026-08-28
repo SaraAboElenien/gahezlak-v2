@@ -714,8 +714,14 @@ describe("cancelSubscription", () => {
       cancelledAt: new Date(Date.now() - 30 * DAY),
     });
 
+    // SUBSCRIPTION_EXPIRED rather than NO_ACTIVE_SUBSCRIPTION: this shop has a
+    // subscription and it ran out, which is a state it can fix by paying. The
+    // middleware used to reserve that message for `status === EXPIRED` alone
+    // and tell everyone else "No active subscription found for user" — untrue
+    // here, and untrue of a lapsed ACTIVE row, which became reachable once
+    // ACTIVE was gated on the clock.
     await expect(assertShopHasActiveSubscription(SHOP_A)).rejects.toThrow(
-      errMsg.NO_ACTIVE_SUBSCRIPTION.en,
+      errMsg.SUBSCRIPTION_EXPIRED.en,
     );
   });
 

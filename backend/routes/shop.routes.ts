@@ -28,6 +28,7 @@ import * as shopAnalysisControllers from "../controllers/shop-analysis.controlle
 
 import { validateOrderId } from "../validators/order.validator";
 import { uploadSingleMiddleware } from "../middlewares/multer";
+import { qrCodeRateLimiter } from "../middlewares/rate-limit.middleware";
 
 const router = express.Router();
 
@@ -87,15 +88,11 @@ router.put(
   controllers.updateMemberRoleHandler,
 );
 
-// --- QR Code Management ---
-router.post(
-  "/qr-code",
-  protect,
-  isAllowed([Role.ADMIN, Role.SHOP_OWNER, Role.SHOP_MANAGER]),
-  shopValidators.validateRegenerateQRCode,
-  isShopMember,
-  controllers.regenerateQRCodeHandler,
-);
+// QR codes are generated on demand — see the public
+// `/name/:shopName/qr-code.png` route below — so there is no longer a
+// separate "regenerate" endpoint to authenticate. `POST /shops/qr-code`
+// (deleted) always rendered the current shop name anyway; every GET of the
+// PNG route below already does that on every call.
 
 // --- Subscription Management ---
 router.post(
@@ -119,6 +116,19 @@ router.get(
   "/name/:shopName",
   shopValidators.shopNameParamValidator,
   controllers.getShopHandler,
+);
+
+// The QR code itself, rendered on demand (see qr-code-generator.ts and
+// getShopQrCodeHandler for why: no imgbb dependency, and no URL baked in at
+// creation time). `qrCodeRateLimiter` is applied here rather than
+// router-wide, the same way `aiRateLimiter` is scoped to just the AI router —
+// this is the only route in this file that does real per-request CPU work
+// (a PNG encode) with no authentication behind it.
+router.get(
+  "/name/:shopName/qr-code.png",
+  qrCodeRateLimiter,
+  shopValidators.shopNameParamValidator,
+  controllers.getShopQrCodeHandler,
 );
 
 // For public usage (customers)

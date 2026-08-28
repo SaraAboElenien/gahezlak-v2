@@ -49,9 +49,32 @@ import {
 } from "./lib/sitemap";
 import { createApiWarmer, type ApiWarmerOptions } from "./lib/warm-api";
 
-/** Hard ceilings — a slow backend must never hang a page or a crawler. */
+/**
+ * Hard ceilings — a slow backend must never hang a page or a crawler.
+ *
+ * `SHOP_API_TIMEOUT_MS` is per *attempt* and is deliberately unchanged: a warm
+ * API answers this in tens of milliseconds, so the happy path is byte-for-byte
+ * what it was, and a single hung connection still can't hold a page for long.
+ *
+ * `SHOP_API_TOTAL_BUDGET_MS` is the ceiling across the retry (see
+ * `fetchShopForSeo`). 6s is chosen against the consumer that matters here:
+ * link-preview scrapers. Facebook/WhatsApp, X and Slack all abandon a slow
+ * page in roughly the 8–10s region, and this response is HTML that a human may
+ * also be waiting on — so the whole lookup has to finish comfortably inside
+ * that, with room for the TLS handshake and the SPA shell behind it. Anything
+ * larger trades a rich preview for a page that feels broken, which is the
+ * wrong way round: the page is the product, the metadata is the garnish.
+ */
 const SHOP_API_TIMEOUT_MS = 2500;
+const SHOP_API_TOTAL_BUDGET_MS = 6000;
 const SHOP_LIST_TIMEOUT_MS = 4000;
+
+/**
+ * Below this, a second attempt cannot complete a handshake, let alone a
+ * request — spending the remainder just delays the fallback we already know
+ * we're serving.
+ */
+const MIN_RETRY_BUDGET_MS = 250;
 
 export interface WarmApiConfig extends Omit<ApiWarmerOptions, "apiBase"> {
   /**
@@ -76,12 +99,89 @@ export interface ServerConfig {
    * Omitted or `{ enabled: false }` makes it a complete no-op.
    */
   warmApi?: WarmApiConfig;
+  /**
+   * Where degraded-SEO warnings go. Injected for tests; defaults to
+   * `console.warn`, which on Render is simply the service log.
+   */
+  logWarn?: (message: string) => void;
+  /** Per-attempt abort budget for the per-shop lookup. Injected for tests. */
+  shopApiTimeoutMs?: number;
+  /** Ceiling across all attempts of the per-shop lookup. For tests. */
+  shopApiTotalBudgetMs?: number;
+}
+
+/** Classification of why a per-shop metadata lookup didn't produce a shop. */
+type ShopFetchFailureReason =
+  /** Nothing came back inside the attempt's abort budget. */
+  | "timeout"
+  /** The API answered, with a status we can't use. */
+  | "http"
+  /** Connection-level failure: DNS, refused, reset, TLS. */
+  | "network"
+  /** A 2xx whose body wasn't the JSON we expect (proxy/WAF interstitial). */
+  | "body";
+
+interface ShopFetchSuccess {
+  ok: true;
+  /** Present-but-empty is a real answer: the slug matched no shop. */
+  shop: ShopSeoSource | undefined;
+}
+
+interface ShopFetchFailure {
+  ok: false;
+  reason: ShopFetchFailureReason;
+  detail: string;
+  /** Whether a second attempt could plausibly give a different answer. */
+  retryable: boolean;
+}
+
+/** The result of one request. */
+type ShopFetchAttempt = ShopFetchSuccess | ShopFetchFailure;
+
+/**
+ * The result of the whole lookup. Written as an intersection rather than by
+ * extending both members, so `Omit`ting the wrapper's fields off it stays
+ * possible without collapsing the union it wraps.
+ */
+type ShopFetchOutcome = ShopFetchAttempt & {
+  /** How many requests were actually issued (1 or 2). */
+  attempts: number;
+  elapsedMs: number;
+};
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * `AbortSignal.timeout` rejects with a `TimeoutError` DOMException; a manual
+ * abort (and some older runtimes) uses `AbortError`. Returns null for anything
+ * that isn't the clock running out, so the caller can classify it properly
+ * instead of blaming a slow backend for a refused connection.
+ */
+function asTimeoutFailure(
+  error: unknown,
+  timeoutMs: number,
+): ShopFetchFailure | null {
+  const name = error instanceof Error ? error.name : "";
+  if (name !== "TimeoutError" && name !== "AbortError") return null;
+  return {
+    ok: false,
+    reason: "timeout",
+    detail: `no response within ${timeoutMs}ms`,
+    retryable: true,
+  };
 }
 
 export function createApp(config: ServerConfig): express.Express {
   const apiBase = config.apiBase.replace(/\/+$/, "");
   const siteUrl = (config.siteUrl ?? "").replace(/\/+$/, "");
   const indexHtmlPath = path.join(config.distDir, "index.html");
+  const logWarn =
+    config.logWarn ?? ((message: string) => console.warn(message));
+  const shopApiTimeoutMs = config.shopApiTimeoutMs ?? SHOP_API_TIMEOUT_MS;
+  const shopApiTotalBudgetMs =
+    config.shopApiTotalBudgetMs ?? SHOP_API_TOTAL_BUDGET_MS;
 
   const { enabled: warmApiEnabled = false, ...warmerOptions } =
     config.warmApi ?? {};
@@ -173,9 +273,14 @@ export function createApp(config: ServerConfig): express.Express {
 
     try {
       entries.push(...buildShopSitemapEntries(origin, await fetchShops()));
-    } catch {
+    } catch (error) {
       // Backend down, slow, or returning something unexpected — degrade to the
-      // minimal sitemap above.
+      // minimal sitemap above. Logged rather than swallowed: a sitemap that
+      // silently lists no shops is indistinguishable, to a crawler and to us,
+      // from a site that has none.
+      logWarn(
+        `[seo] /sitemap.xml: shop list unavailable (${describeError(error)}) — serving landing page only`,
+      );
     }
 
     res.setHeader("content-type", "application/xml; charset=utf-8");
@@ -213,18 +318,110 @@ export function createApp(config: ServerConfig): express.Express {
     return cachedIndexHtml;
   }
 
-  async function fetchShop(slug: string): Promise<ShopSeoSource | undefined> {
+  /**
+   * One request. Never throws — every way this can go wrong is returned as a
+   * classified failure, because "the metadata is generic" and "the API is
+   * unreachable from this container" have to be distinguishable in the log.
+   */
+  async function attemptFetchShop(
+    slug: string,
+    timeoutMs: number,
+  ): Promise<ShopFetchAttempt> {
     // Matches `publicShopApi.getShopDetails` — GET {base}/shops/name/:shopName.
-    const response = await fetch(
-      `${apiBase}/shops/name/${encodeURIComponent(slug)}`,
-      {
-        headers: { accept: "application/json" },
-        signal: AbortSignal.timeout(SHOP_API_TIMEOUT_MS),
-      },
+    let response: Response;
+    try {
+      response = await fetch(
+        `${apiBase}/shops/name/${encodeURIComponent(slug)}`,
+        {
+          headers: { accept: "application/json" },
+          signal: AbortSignal.timeout(timeoutMs),
+        },
+      );
+    } catch (error) {
+      return (
+        asTimeoutFailure(error, timeoutMs) ?? {
+          ok: false,
+          reason: "network",
+          detail: describeError(error),
+          retryable: true,
+        }
+      );
+    }
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        reason: "http",
+        detail: `HTTP ${response.status}`,
+        // A 4xx is an answer, not a hiccup — the slug genuinely isn't a shop,
+        // and asking twice can't change that. 5xx and 429 are what a Render
+        // instance emits while it is still coming up, so those get one retry.
+        retryable: response.status >= 500 || response.status === 429,
+      };
+    }
+
+    try {
+      const payload = (await response.json()) as {
+        data?: ShopSeoSource;
+      } | null;
+      return { ok: true, shop: payload?.data };
+    } catch (error) {
+      return (
+        asTimeoutFailure(error, timeoutMs) ?? {
+          ok: false,
+          reason: "body",
+          // A 2xx that isn't JSON is a proxy or WAF interstitial, not a slow
+          // backend; the retry would fetch the identical page.
+          detail: describeError(error),
+          retryable: false,
+        }
+      );
+    }
+  }
+
+  /**
+   * The per-shop lookup, with at most one retry inside a fixed total budget.
+   *
+   * WHY RETRY AT ALL: the failure this exists for is a cold Render API, and
+   * that has two signatures. It can hang (we abort at `shopApiTimeoutMs`), or
+   * — while the instance is spinning up — Render's router can reject in
+   * milliseconds with a 5xx or a reset. The second kind is the one a retry
+   * genuinely rescues, because the first attempt cost almost nothing and the
+   * warm-up fired just above may have landed in between.
+   *
+   * WHY IT'S BOUNDED BY TIME, NOT BY COUNT: budget, not attempt count, is what
+   * a waiting scraper actually experiences. Retrying only while there is time
+   * left means a fast failure gets a real second chance while a slow one
+   * doesn't stack two full timeouts on top of each other.
+   *
+   * This does NOT pretend to survive a genuine ~50s cold start; nothing at
+   * this layer can, and holding the page hostage waiting for one would be a
+   * far worse trade. Waking the API early is `lib/warm-api.ts`'s job.
+   */
+  async function fetchShopForSeo(slug: string): Promise<ShopFetchOutcome> {
+    const startedAt = Date.now();
+    const first = await attemptFetchShop(
+      slug,
+      Math.min(shopApiTimeoutMs, shopApiTotalBudgetMs),
     );
-    if (!response.ok) return undefined;
-    const payload = (await response.json()) as { data?: ShopSeoSource } | null;
-    return payload?.data;
+    if (first.ok || !first.retryable) {
+      return { ...first, attempts: 1, elapsedMs: Date.now() - startedAt };
+    }
+
+    // Capped by the per-attempt budget as well, so a deployment (or a test)
+    // that deliberately runs on a tiny budget doesn't have the floor exceed
+    // the whole attempt and quietly disable the retry.
+    const minRetryBudget = Math.min(MIN_RETRY_BUDGET_MS, shopApiTimeoutMs);
+    const remaining = shopApiTotalBudgetMs - (Date.now() - startedAt);
+    if (remaining < minRetryBudget) {
+      return { ...first, attempts: 1, elapsedMs: Date.now() - startedAt };
+    }
+
+    const second = await attemptFetchShop(
+      slug,
+      Math.min(shopApiTimeoutMs, remaining),
+    );
+    return { ...second, attempts: 2, elapsedMs: Date.now() - startedAt };
   }
 
   // SPA fallback, plus the per-shop <head> rewrite. Registered with `app.use`
@@ -270,16 +467,38 @@ export function createApp(config: ServerConfig): express.Express {
     // free instance-hour allowance.
     void warmer?.warm(`request ${req.path}`);
 
-    // Everything below degrades to the untouched index.html rather than taking
-    // a shop's page down: a slow or broken backend must cost us the rich
-    // preview, never the page itself.
+    /**
+     * The degraded path, taken whenever we couldn't build real tags.
+     *
+     * It must stay a 200 with the plain SPA — a slow or broken backend costs
+     * us the rich preview, never the page itself. But it must not stay
+     * *silent*: this is exactly the shape that made a cold-start miss
+     * invisible, serving crawlers and scrapers the generic <head> with a 200
+     * and nothing anywhere to show it had happened.
+     */
+    function sendGeneric(why: string) {
+      logWarn(
+        `[seo] ${req.path}: shop "${slug}" ${why} — serving generic <head>`,
+      );
+      res.setHeader("cache-control", "no-cache");
+      return res.status(200).send(html);
+    }
+
     try {
-      const shop = await fetchShop(slug);
+      const outcome = await fetchShopForSeo(slug);
+      if (!outcome.ok) {
+        return sendGeneric(
+          `lookup failed (${outcome.reason}: ${outcome.detail}) after ` +
+            `${outcome.attempts} attempt(s) in ${outcome.elapsedMs}ms`,
+        );
+      }
+
       const canonicalUrl = `${origin}${canonicalShopPath(req.path)}`;
-      const tags = buildShopSeoTags(shop, canonicalUrl);
+      const tags = buildShopSeoTags(outcome.shop, canonicalUrl);
       if (!tags) {
-        res.setHeader("cache-control", "no-cache");
-        return res.status(200).send(html);
+        // The API answered, and had nothing usable to say. Ordinary for a slug
+        // nobody has ever registered; a signal if it's a shop that exists.
+        return sendGeneric(`returned no usable data in ${outcome.elapsedMs}ms`);
       }
 
       // Per-shop HTML is stable and its URL unique per shop, so let any CDN in
@@ -289,9 +508,10 @@ export function createApp(config: ServerConfig): express.Express {
         "public, max-age=0, s-maxage=300, stale-while-revalidate=86400",
       );
       return res.status(200).send(injectShopSeo(html, tags));
-    } catch {
-      res.setHeader("cache-control", "no-cache");
-      return res.status(200).send(html);
+    } catch (error) {
+      // `fetchShopForSeo` doesn't throw, so reaching here means the rewrite
+      // itself did — a bug, not a backend problem, and worth saying so.
+      return sendGeneric(`rewrite threw (${describeError(error)})`);
     }
   });
 

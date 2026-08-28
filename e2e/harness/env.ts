@@ -54,8 +54,11 @@ export function setupEnv(mongoUri: string): void {
   // Required by config/env-validation.ts or the app refuses to boot.
   process.env.JWT_SECRET = "e2e-only-jwt-secret-not-used-anywhere-real";
   // Must match the browser origin exactly: the CORS callback in app.ts rejects
-  // anything else with a 405 *before* routing, and it is also what
-  // utils/qr-code-generator.ts bakes into a new shop's QR code.
+  // anything else with a 405 *before* routing, and it is also the origin
+  // `utils/qr-code-generator.ts` encodes into every QR code it renders. That
+  // second use is now read at *call* time rather than baked into a stored
+  // image, which is what `auth-onboarding.spec.ts` decodes a real PNG to
+  // prove.
   process.env.FRONTEND_URL = FRONTEND_URL;
 
   // Not "production": that would make the refresh cookie Secure + SameSite=None,
@@ -70,9 +73,15 @@ export function setupEnv(mongoUri: string): void {
   // long these tests take; it has no bearing on what they prove.
   process.env.BCRYPT_SALT_ROUNDS = "4";
 
-  // Present so utils/upload-to-imgbb.ts builds a well-formed URL. The request
-  // never leaves the process — see stub-external.ts.
-  process.env.IMGBB_KEY = "e2e-stub-key";
+  // Present so `config/cloudinary.ts`'s getCloudinaryConfig() returns a config
+  // rather than null — without all three, utils/upload-image.ts throws
+  // IMAGE_UPLOAD_FAILED *before* it ever calls fetch, so the stub would never
+  // be reached and attaching a photo to a menu item would 400. The values are
+  // meaningless: the request never leaves the process (see stub-external.ts),
+  // and nothing verifies the signature they produce.
+  process.env.CLOUDINARY_CLOUD_NAME = "e2e-stub-cloud";
+  process.env.CLOUDINARY_API_KEY = "e2e-stub-key";
+  process.env.CLOUDINARY_API_SECRET = "e2e-stub-secret";
 
   // Point mail at the in-process sink (smtp-sink.ts) rather than leaving the
   // credentials unset. utils/send-email.ts builds its transporter from these

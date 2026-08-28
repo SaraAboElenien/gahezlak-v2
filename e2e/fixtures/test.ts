@@ -17,6 +17,8 @@
  *               nothing to do with what it asserts.
  */
 import { test as base, expect, type APIRequestContext } from "@playwright/test";
+import sharp from "sharp";
+import jsQR from "jsqr";
 import { API_BASE_URL, CONTROL_URL, SEED } from "../harness/config";
 
 export interface SeededIds {
@@ -88,7 +90,6 @@ export class ControlClient {
   async shop(name: string): Promise<{
     name: string;
     type: string;
-    qrCodeUrl?: string;
     logoUrl?: string;
     ownerId: string;
   }> {
@@ -100,22 +101,44 @@ export class ControlClient {
   }
 
   /**
-   * Does the QR code the app uploaded for `shopName` encode the menu URL it
-   * would encode if generated right now? See control.ts for how this is
-   * decided without a QR reader.
+   * Fetch the QR code the API renders for a shop and return the URL it
+   * actually encodes.
+   *
+   * This decodes the real PNG rather than re-encoding one and comparing bytes.
+   * The previous version of this check ran the generator a second time and
+   * compared its output against what the app had uploaded — which could only
+   * ever prove the two agreed. It could not catch both of them encoding the
+   * same wrong origin, and that is exactly the bug that shipped: a live shop's
+   * QR encoded `http://localhost:5173`, permanently, onto printed table
+   * stickers. Reading the URL back out of the image is the assertion that
+   * matters, because it is the thing a diner's phone does.
    */
-  async qrCheck(
-    shopName: string,
-    index = 0,
-  ): Promise<{ matches: boolean; menuUrl: string }> {
+  async qrMenuUrl(shopName: string): Promise<string> {
     const response = await this.request.get(
-      `${CONTROL_URL}/qr/check?shop=${encodeURIComponent(shopName)}&index=${index}`,
+      `${API_BASE_URL}/shops/name/${encodeURIComponent(shopName)}/qr-code.png`,
     );
     expect(
       response.ok(),
-      `qr check failed: ${response.status()} ${await response.text()}`,
+      `qr-code.png failed: ${response.status()} ${await response.text()}`,
     ).toBeTruthy();
-    return response.json();
+    expect(response.headers()["content-type"]).toContain("image/png");
+
+    // jsQR reads raw RGBA. ensureAlpha() guarantees the fourth channel even
+    // though the encoder emits opaque output, so a change in how the PNG is
+    // written cannot quietly hand jsQR three channels and have it misread
+    // every pixel.
+    const { data, info } = await sharp(await response.body())
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const decoded = jsQR(new Uint8ClampedArray(data), info.width, info.height);
+    expect(
+      decoded,
+      `could not decode the QR PNG returned for shop "${shopName}"`,
+    ).not.toBeNull();
+
+    return decoded!.data;
   }
 }
 

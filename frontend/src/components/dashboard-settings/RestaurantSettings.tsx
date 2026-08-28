@@ -7,6 +7,7 @@ import { ErrorComponent } from "../ErrorComponent";
 import { ActionButtons } from "./ActionButtons";
 import { useRestaurantForm } from "@/hooks/useRestaurantForm";
 import { RestaurantForm } from "./RestaurantForm";
+import { shopApi } from "@/services/shopApi";
 import toast from "react-hot-toast";
 
 const RestaurantSettings = () => {
@@ -102,7 +103,16 @@ const RestaurantSettings = () => {
         {/* Form Content */}
         <div className="p-6">
           <RestaurantForm
-            qrImg={userData?.shop?.qrCodeUrl}
+            // Derived from the shop's current name rather than a stored image
+            // URL (the old `shop.qrCodeUrl`, since removed from the profile
+            // response): the backend renders this PNG on demand, so there is
+            // nothing stored to go stale, and a just-saved rename is
+            // reflected immediately without a regenerate step.
+            qrImg={
+              userData?.shop?.name
+                ? shopApi.GetQrCodeImageUrl(userData.shop.name)
+                : undefined
+            }
             form={form}
             isEditing={isEditing}
             onSubmit={onSubmit}

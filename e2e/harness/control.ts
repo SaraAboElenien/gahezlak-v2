@@ -21,13 +21,8 @@ import { createServer, type Server } from "node:http";
 import { Users } from "../../backend/models/User";
 import { Orders } from "../../backend/models/Order";
 import { Shops } from "../../backend/models/Shop";
-import { generateAndUploadMenuQRCode } from "../../backend/utils/qr-code-generator";
 import { reseed } from "./seed";
-import {
-  clearImgbbUploads,
-  getImgbbUploads,
-  truncateImgbbUploads,
-} from "./stub-external";
+import { clearImageUploads, getImageUploads } from "./stub-external";
 
 function send(
   response: import("node:http").ServerResponse,
@@ -55,7 +50,7 @@ export function createControlServer(): Server {
 
         /** Drop everything and rebuild the fixture set. */
         if (path === "/reset" && request.method === "POST") {
-          clearImgbbUploads();
+          clearImageUploads();
           const ids = await reseed();
           return send(response, 200, ids);
         }
@@ -91,7 +86,17 @@ export function createControlServer(): Server {
           return send(response, 200, { orders });
         }
 
-        /** One shop by name — used to read back `qrCodeUrl` / `logoUrl`. */
+        /**
+         * One shop by name — used to read back what the app persisted, e.g.
+         * `logoUrl` after an upload, or that shop creation stored the name the
+         * form submitted.
+         *
+         * It deliberately does NOT serve the QR code. `Shop.qrCodeUrl` still
+         * exists on the schema for old production rows but is written nowhere
+         * and read nowhere: the QR is rendered on demand by
+         * `GET /api/v1/shops/name/:shopName/qr-code.png`, and the specs assert
+         * against that route by decoding the PNG it returns.
+         */
         if (path === "/shop") {
           const name = url.searchParams.get("name") ?? "";
           const shop = await Shops.findOne({ name }).lean();
@@ -100,41 +105,16 @@ export function createControlServer(): Server {
         }
 
         /**
-         * Regression guard for the "QR codes encode a stale FRONTEND_URL"
-         * defect: `utils/qr-code-generator.ts` bakes the origin in at creation
-         * time, so a shop created while FRONTEND_URL pointed at a dev server
-         * keeps a QR that goes nowhere forever.
+         * What the app handed to the image host, in order.
          *
-         * Rather than decode the PNG (which would need a QR *reader*), this
-         * re-encodes what the QR should contain right now — same generator,
-         * same options, current FRONTEND_URL — and compares the bytes against
-         * what the app actually uploaded when the shop was created. `qrcode`
-         * output is deterministic, so equal bytes means equal encoded URL.
-         *
-         * The re-encode is itself an imgbb upload, so the recorded list is
-         * snapshotted and restored around it to keep `index` stable.
+         * The only thing standing between a working upload and a silent
+         * outage here is whether the app called the host at all with the bytes
+         * it was given — which is exactly what went wrong when imgbb started
+         * refusing datacenter IPs, and exactly what a mocked unit test cannot
+         * see. Cleared by `/reset`, so an index is stable within one test.
          */
-        if (path === "/qr/check") {
-          const shopName = url.searchParams.get("shop") ?? "";
-          const index = Number(url.searchParams.get("index") ?? "0");
-          const recorded = getImgbbUploads()[index];
-          if (!recorded) {
-            return send(response, 404, {
-              error: `no imgbb upload recorded at index ${index}`,
-              uploadCount: getImgbbUploads().length,
-            });
-          }
-
-          const before = getImgbbUploads().length;
-          const { menuUrl } = await generateAndUploadMenuQRCode(shopName);
-          const expected = getImgbbUploads()[before];
-          // Undo the extra upload this check just caused.
-          truncateImgbbUploads(before);
-
-          return send(response, 200, {
-            matches: expected?.base64 === recorded.base64,
-            menuUrl,
-          });
+        if (path === "/image-uploads") {
+          return send(response, 200, { uploads: getImageUploads() });
         }
 
         return send(response, 404, { error: `unknown control route ${path}` });

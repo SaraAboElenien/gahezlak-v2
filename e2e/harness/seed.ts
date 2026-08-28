@@ -96,7 +96,8 @@ export async function seedAll(): Promise<SeededIds> {
   const shop = await Shops.create({
     ...SEED.shop,
     ownerId: owner._id,
-    qrCodeUrl: INLINE_IMAGE,
+    // No qrCodeUrl: the QR is rendered on demand by
+    // GET /shops/name/:shopName/qr-code.png and is stored nowhere.
     logoUrl: INLINE_IMAGE,
     members: [{ userId: owner._id, roleId: roleByName.get(Role.SHOP_OWNER)! }],
   });

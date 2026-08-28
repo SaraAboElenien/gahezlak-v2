@@ -113,7 +113,7 @@ export async function getUserProfile(userId: string) {
     .populate({
       path: "shop",
       select:
-        "name address phoneNumber type email qrCodeUrl logoUrl subscriptionId createdAt updatedAt",
+        "name address phoneNumber type email logoUrl subscriptionId createdAt updatedAt",
       populate: {
         path: "subscriptionId",
         select: "status currentPeriodStart currentPeriodEnd plan",

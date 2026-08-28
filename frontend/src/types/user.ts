@@ -62,7 +62,6 @@ export interface UserProfile {
       currentPeriodStart: string;
       currentPeriodEnd: string;
     };
-    qrCodeUrl?: string;
     logoUrl?: string;
     createdAt: string;
     updatedAt: string;
@@ -116,13 +115,5 @@ export interface ConfirmChangeMailResponse {
   data: {
     user: UserProfile;
     message: string;
-  };
-}
-
-export interface RegenerateQrCodeResponse {
-  message: string;
-  data: {
-    qrCodeUrl: string;
-    menuUrl: string;
   };
 }

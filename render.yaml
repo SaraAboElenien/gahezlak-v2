@@ -210,10 +210,23 @@ services:
         sync: false
 
       # --- Image hosting -------------------------------------------------
-      # Required in practice for ANY shop creation, not just logo uploads:
-      # createShopHandler unconditionally generates and uploads a QR code, so
-      # shop creation 500s without a real key.
-      - key: IMGBB_KEY
+      # Image hosting for shop logos and menu-item images.
+      #
+      # Replaced IMGBB_KEY (now removed) on 2026-08-25. imgbb rejects requests from
+      # datacenter IP ranges outright -- error code 103, "You have been
+      # forbidden to use this website" -- so uploads succeeded from a laptop
+      # and failed from every Render instance. That broke shop creation, logo
+      # changes and menu-item images on the live site, and surfaced only as a
+      # blank 500 until the uploader was hardened to log the response body.
+      #
+      # All three are required together. Set them in the dashboard; the
+      # uploader refuses and names whichever is missing rather than failing
+      # later as a broken image.
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
         sync: false
 
       # --- Paymob (payments + subscriptions) -----------------------------

@@ -1,47 +1,39 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import QRCode from "qrcode";
+import {
+  buildMenuUrl,
+  generateMenuQRCodeBuffer,
+} from "../../utils/qr-code-generator";
 
 /**
- * QR-code generation, and the error handling around it.
+ * QR-code generation.
  *
- * This is the product's headline feature — a diner scans the code on the table
- * and lands on the menu — and it has failed in production in two distinct ways
- * that both stayed invisible for weeks:
+ * This is the product's headline feature — a diner scans the code on the
+ * table and lands on the menu — and it used to fail in production in ways
+ * that stayed invisible for weeks, both traceable to the old design: a QR
+ * image was rendered once at shop-creation time, uploaded to imgbb, and the
+ * returned URL stored on the shop forever.
  *
- *   1. The deployed shop's QR encoded `http://localhost:5173/...`, because the
- *      URL is baked in at *creation* time from FRONTEND_URL and the code was
- *      generated while that still held the dev value. Nothing re-checks it
- *      afterwards, so a stale code looks perfectly healthy from the outside.
+ *   1. The deployed shop's QR encoded `http://localhost:5173/...`, because
+ *      the URL was baked in at *creation* time from FRONTEND_URL, and the
+ *      code was generated while that env var still held the dev value.
+ *      Nothing ever re-checked it afterwards.
+ *   2. imgbb started refusing requests from the deployed host's datacenter IP
+ *      range entirely, which meant no new shop could be created at all.
  *
- *   2. `POST /shops/qr-code` answered a blank 500 on the live API while the
- *      identical code path succeeded locally against the same database. The
- *      cause was environmental (an unset IMGBB_KEY), but it was undiagnosable
- *      from the response, because the generator caught every error and rethrew
- *      it as a bare `Error` — discarding the typed BadRequestError that carried
- *      the real status and message.
- *
- * So these tests pin the error *types*, not just the happy path: the value of
- * a typed error here is that it survives the catch and reaches the client as
- * something other than "Internal server error".
+ * `generateMenuQRCodeBuffer` (which replaced the old
+ * `generateAndUploadMenuQRCode`) exists to make both classes of bug
+ * structurally impossible rather than fixing one instance: it does no
+ * network call, stores nothing, and reads `FRONTEND_URL` at *call* time, so
+ * the regression test below — that the same shop name encodes a different
+ * URL once FRONTEND_URL changes — is the one that matters most here.
  */
 
-const uploadToImgbbMock = vi.hoisted(() => vi.fn());
-
-vi.mock("../../utils/upload-to-imgbb", () => ({
-  default: uploadToImgbbMock,
-}));
-
-const ENV_KEYS = ["FRONTEND_URL", "IMGBB_KEY"] as const;
+const ENV_KEYS = ["FRONTEND_URL"] as const;
 const original: Record<string, string | undefined> = {};
 
 beforeEach(() => {
   for (const k of ENV_KEYS) original[k] = process.env[k];
-  vi.clearAllMocks();
-  vi.resetModules();
-  uploadToImgbbMock.mockResolvedValue({
-    success: true,
-    status: 200,
-    data: { id: "abc", url: "https://i.ibb.co/abc/qr.png" },
-  });
 });
 
 afterEach(() => {
@@ -51,45 +43,28 @@ afterEach(() => {
   }
 });
 
-async function importGenerator() {
-  return (await import("../../utils/qr-code-generator"))
-    .generateAndUploadMenuQRCode;
-}
-
-describe("generateAndUploadMenuQRCode", () => {
-  it("encodes the menu URL from the base URL it is given", async () => {
-    const generate = await importGenerator();
-
-    const { menuUrl, qrCodeUrl } = await generate(
-      "Fauget",
-      "https://gahezlak-web.onrender.com",
-    );
+describe("buildMenuUrl", () => {
+  it("builds the menu URL from an explicit base URL", () => {
+    const menuUrl = buildMenuUrl("Fauget", "https://gahezlak-web.onrender.com");
 
     expect(menuUrl).toBe("https://gahezlak-web.onrender.com/shops/Fauget/menu");
-    expect(qrCodeUrl).toBe("https://i.ibb.co/abc/qr.png");
   });
 
-  it("falls back to FRONTEND_URL when no base URL is passed", async () => {
-    // This is the bug-1 surface above: the caller in shop.service.ts passes
-    // `undefined`, so whatever FRONTEND_URL holds at that moment is what gets
-    // permanently baked into the image.
+  it("falls back to FRONTEND_URL when no base URL is passed", () => {
     process.env.FRONTEND_URL = "https://gahezlak-web.onrender.com";
-    const generate = await importGenerator();
 
-    const { menuUrl } = await generate("Fauget");
-
-    expect(menuUrl).toBe("https://gahezlak-web.onrender.com/shops/Fauget/menu");
+    expect(buildMenuUrl("Fauget")).toBe(
+      "https://gahezlak-web.onrender.com/shops/Fauget/menu",
+    );
   });
 
-  it("percent-encodes the shop name so punctuation cannot truncate the URL", async () => {
-    // `/shops/:slug/menu` is declared in frontend/src/Layout.tsx. A QR pointing
-    // at any other shape resolves to a 404 for every diner who scans it, which
-    // is not observable from the backend at all. "#" is the dangerous case:
-    // unencoded it turns the rest of the path into a fragment.
-    process.env.FRONTEND_URL = "https://example.test";
-    const generate = await importGenerator();
-
-    const { menuUrl } = await generate("Joe's Diner #2");
+  it("percent-encodes the shop name so punctuation cannot truncate the URL", () => {
+    // `/shops/:slug/menu` is declared in frontend/src/Layout.tsx. A QR
+    // pointing at any other shape resolves to a 404 for every diner who scans
+    // it, which is not observable from the backend at all. "#" is the
+    // dangerous case: unencoded it turns the rest of the path into a
+    // fragment.
+    const menuUrl = buildMenuUrl("Joe's Diner #2", "https://example.test");
 
     expect(menuUrl).toBe(
       "https://example.test/shops/Joe's%20Diner%20%232/menu",
@@ -100,73 +75,91 @@ describe("generateAndUploadMenuQRCode", () => {
     );
   });
 
-  it("preserves a typed upload error instead of flattening it to a 500", async () => {
-    // The regression that made the production failure opaque. If this starts
-    // failing, the endpoint has gone back to answering a blank "Internal server
-    // error" for causes it can actually name.
-    //
-    // The error class is imported from the SAME module registry the generator
-    // sees. vi.resetModules() gives each dynamic import a fresh copy of
-    // ../../errors, so a class captured at the top of this file is a different
-    // object than the one the generator checks against and `instanceof` fails
-    // for reasons that have nothing to do with the behaviour under test.
-    const { Errors: freshErrors } = await import("../../errors");
-    uploadToImgbbMock.mockRejectedValue(
-      new freshErrors.BadRequestError("IMAGE_UPLOAD_FAILED"),
-    );
-    const generate = await importGenerator();
+  /**
+   * THE regression this whole change exists to prevent: the old code path
+   * read FRONTEND_URL exactly once, at shop-creation time, and then stored
+   * the rendered image's address — so a later change to FRONTEND_URL (or a
+   * redeploy pointing at a different origin) was invisible forever, which is
+   * exactly what happened to the one real deployed shop. Generating on
+   * demand only fixes that if the env var really is read fresh on every
+   * call, not memoized anywhere — this is the test that would fail if
+   * someone "optimized" that away.
+   */
+  it("reflects the CURRENT FRONTEND_URL rather than a value captured earlier", () => {
+    process.env.FRONTEND_URL = "http://localhost:5173";
+    const stale = buildMenuUrl("Fauget");
+    expect(stale).toBe("http://localhost:5173/shops/Fauget/menu");
 
-    const err = await generate("Fauget", "https://example.test").catch(
-      (e) => e,
-    );
+    // The origin changes — e.g. a deploy to the real host — with no code
+    // change and no restart.
+    process.env.FRONTEND_URL = "https://gahezlak-web.onrender.com";
+    const fresh = buildMenuUrl("Fauget");
 
-    expect(err).toBeInstanceOf(freshErrors.CustomError);
-    expect(err.statusCode).toBe(400);
-  });
-
-  it("still wraps genuinely unknown errors with context", async () => {
-    uploadToImgbbMock.mockRejectedValue(new Error("socket hang up"));
-    const generate = await importGenerator();
-
-    await expect(generate("Fauget", "https://example.test")).rejects.toThrow(
-      /Failed to generate and upload QR code: socket hang up/,
-    );
-  });
-
-  it("rejects a 2xx upload that returned no hosted URL", async () => {
-    // Otherwise the shop is saved with `qrCodeUrl: undefined` and the problem
-    // surfaces much later as a broken image in the dashboard.
-    uploadToImgbbMock.mockResolvedValue({ success: true, status: 200 });
-    const generate = await importGenerator();
-
-    await expect(generate("Fauget", "https://example.test")).rejects.toThrow(
-      /returned no image URL/,
-    );
+    expect(fresh).toBe("https://gahezlak-web.onrender.com/shops/Fauget/menu");
+    expect(fresh).not.toBe(stale);
   });
 });
 
-describe("uploadToImgbb", () => {
-  it("fails with a typed error, and never calls imgbb, when IMGBB_KEY is unset", async () => {
-    // The actual production cause. Without the guard the key interpolates as
-    // the string "undefined", imgbb answers 400 "Invalid API v1 key", and the
-    // failure reads as a bad image rather than a missing deployment variable.
-    vi.doUnmock("../../utils/upload-to-imgbb");
-    vi.resetModules();
-    delete process.env.IMGBB_KEY;
+describe("generateMenuQRCodeBuffer", () => {
+  it("returns a real PNG buffer and the menu URL it encodes", async () => {
+    process.env.FRONTEND_URL = "https://example.test";
 
+    const { buffer, menuUrl } = await generateMenuQRCodeBuffer("Fauget");
+
+    expect(menuUrl).toBe("https://example.test/shops/Fauget/menu");
+    expect(Buffer.isBuffer(buffer)).toBe(true);
+    // PNG magic number: 0x89 'P' 'N' 'G' '\r' '\n' 0x1A '\n'.
+    expect(buffer.subarray(0, 8)).toEqual(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    );
+  });
+
+  it("makes no network call — it is a pure local render", async () => {
+    // The bug this exists to eliminate: imgbb blocking the deployed host.
+    // There is nothing left in this function that could reproduce it.
     const fetchSpy = vi.spyOn(globalThis, "fetch");
-    const uploadToImgbb = (await import("../../utils/upload-to-imgbb")).default;
-    // Same module-registry caveat as above.
-    const { Errors: freshErrors } = await import("../../errors");
 
-    const err = await uploadToImgbb({
-      buffer: Buffer.from("x"),
-    } as Express.Multer.File).catch((e) => e);
+    await generateMenuQRCodeBuffer("Fauget", "https://example.test");
 
-    expect(err).toBeInstanceOf(freshErrors.BadRequestError);
-    expect(err.statusCode).toBe(400);
     expect(fetchSpy).not.toHaveBeenCalled();
-
     fetchSpy.mockRestore();
+  });
+
+  it("produces bytes identical to encoding the same URL directly with the qrcode library", async () => {
+    // Rather than trying to decode the PNG back into text (awkward, and not
+    // what production code needs to be correct), this compares against the
+    // same library used the same way — the most direct way to pin "the right
+    // URL was actually encoded" without reimplementing a QR decoder.
+    const { buffer, menuUrl } = await generateMenuQRCodeBuffer(
+      "Fauget",
+      "https://example.test",
+    );
+    const expected = await QRCode.toBuffer(menuUrl, {
+      width: 300,
+      margin: 2,
+      color: { dark: "#000000", light: "#FFFFFF" },
+      errorCorrectionLevel: "M",
+    });
+
+    expect(buffer).toEqual(expected);
+  });
+
+  it("respects caller-supplied rendering options", async () => {
+    const { buffer } = await generateMenuQRCodeBuffer(
+      "Fauget",
+      "https://example.test",
+      { width: 500, errorCorrectionLevel: "H" },
+    );
+    const expected = await QRCode.toBuffer(
+      "https://example.test/shops/Fauget/menu",
+      {
+        width: 500,
+        margin: 2,
+        color: { dark: "#000000", light: "#FFFFFF" },
+        errorCorrectionLevel: "H",
+      },
+    );
+
+    expect(buffer).toEqual(expected);
   });
 });

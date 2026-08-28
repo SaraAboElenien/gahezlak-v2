@@ -1,9 +1,7 @@
 import type { ShopFormData } from "@/types/validations/user/shop.schema";
 import { axiosInstance } from "./axiosInint";
-import type {
-  RegenerateQrCodeResponse,
-  UserProfileResponse,
-} from "@/types/user";
+import { BASE_URL } from "@/config/api";
+import type { UserProfileResponse } from "@/types/user";
 import type { GetShopByAdminResponse, Shop } from "@/types/shop";
 import type { Category } from "@/types/category";
 
@@ -63,11 +61,18 @@ export const shopApi = {
       .then((res) => res.data);
   },
 
-  RegenerateQrCode: (data: {
-    width: number;
-    margin: number;
-    errorCorrectionLevel: string;
-  }): Promise<RegenerateQrCodeResponse> => {
-    return axiosInstance.post(`/shops/qr-code`, data).then((res) => res.data);
+  /**
+   * The QR code image URL for a shop, computed rather than read off the
+   * shop record. There is no `POST /shops/qr-code` any more — the backend
+   * renders this PNG fresh on every request from the shop's *current* name
+   * and `FRONTEND_URL` (see `backend/utils/qr-code-generator.ts`), so there
+   * is nothing to "regenerate" and nothing worth caching client-side either.
+   * Deriving it here from `shopName` (rather than trusting a stored
+   * `shop.qrCodeUrl`) is what keeps it from ever going stale the way the old
+   * imgbb-hosted URL did — a renamed shop or a changed `FRONTEND_URL` is
+   * reflected the next time this is called, with nothing to update.
+   */
+  GetQrCodeImageUrl: (shopName: string): string => {
+    return `${BASE_URL}/shops/name/${encodeURIComponent(shopName)}/qr-code.png`;
   },
 };

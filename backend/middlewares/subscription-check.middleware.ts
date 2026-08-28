@@ -28,9 +28,25 @@ export async function assertShopHasActiveSubscription(
     return;
   }
 
-  // Past due is worth its own message: the shop can fix it by paying, which is
-  // not true of the others.
-  if (subscription.status === SubscriptionStatus.EXPIRED) {
+  // Past due is worth its own message: the shop fixes it by paying, which is
+  // not true of the others. That now has to cover a subscription whose stored
+  // status still reads ACTIVE, TRIALING or CANCELLED but whose period has run
+  // out. Before the clock was consulted for ACTIVE, a lapsed ACTIVE row could
+  // not reach this line at all; it now can, and "No active subscription found
+  // for user" would be both inaccurate (there is one, and it says active) and
+  // unactionable. Statuses that were never paid for are deliberately excluded,
+  // so a PENDING checkout that was abandoned is not told it "expired".
+  const lapsable: SubscriptionStatus[] = [
+    SubscriptionStatus.ACTIVE,
+    SubscriptionStatus.TRIALING,
+    SubscriptionStatus.CANCELLED,
+  ];
+  const hasLapsed =
+    subscription.status === SubscriptionStatus.EXPIRED ||
+    (lapsable.includes(subscription.status) &&
+      subscription.currentPeriodEnd <= new Date());
+
+  if (hasLapsed) {
     throw new Errors.NotAllowedError(errMsg.SUBSCRIPTION_EXPIRED);
   }
 

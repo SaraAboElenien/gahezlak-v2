@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
-import { createApp } from "./app";
+import { createApp, type ServerConfig } from "./app";
 
 /**
  * Coverage for the server glue that replaced the Vercel Edge Middleware and
@@ -57,20 +57,53 @@ afterAll(() => {
   fs.rmSync(distDir, { recursive: true, force: true });
 });
 
+/**
+ * Every warning the app emitted during the current test. Captured rather than
+ * left on `console.warn` so the suite stays quiet AND so the degraded-SEO
+ * path — the one that used to be completely silent — can be asserted on.
+ */
+let warnings: string[];
+
 beforeEach(() => {
   vi.restoreAllMocks();
+  warnings = [];
 });
 
-function app() {
-  return createApp({ apiBase: API_BASE, distDir });
+function app(overrides: Partial<ServerConfig> = {}) {
+  return createApp({
+    apiBase: API_BASE,
+    distDir,
+    logWarn: (message) => warnings.push(message),
+    ...overrides,
+  });
 }
 
 /** Minimal stand-in for the shape the routes read off a fetch Response. */
-function jsonResponse(body: unknown, ok = true) {
+function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 404) {
   return {
     ok,
+    status,
     json: async () => body,
   } as unknown as Response;
+}
+
+/**
+ * A fetch that never answers and only settles when its own abort signal
+ * fires, rejecting with the signal's real reason. That reproduces a sleeping
+ * Render service faithfully — including the `TimeoutError` DOMException that
+ * `AbortSignal.timeout` aborts with, which is what the classification reads —
+ * without waiting a real multi-second timeout: the tests pair it with an
+ * injected millisecond-scale budget.
+ */
+function sleepingFetch() {
+  return vi.fn(
+    (_url: string, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(init.signal?.reason ?? new Error("aborted"));
+        });
+      }),
+  );
 }
 
 describe("per-shop <head> rewrite", () => {
@@ -149,6 +182,148 @@ describe("per-shop <head> rewrite", () => {
 
     const spaRes = await request(app()).get("/login");
     expect(spaRes.headers["cache-control"]).toBe("no-cache");
+  });
+});
+
+describe("cold-start SEO misses are diagnosable", () => {
+  /**
+   * The bug this covers, measured on 2026-08-25: a request to a shop page
+   * against a cold stack returned the *generic* <title> while three warm
+   * requests straight afterwards returned the shop's own. The API was asleep,
+   * the 2.5s abort fired, and the handler fell back to the untouched
+   * index.html with a 200 and nothing logged — so the traffic that matters
+   * most for this feature (crawlers and link scrapers, which always arrive
+   * cold) was being served the generic page invisibly.
+   *
+   * Millisecond budgets are injected so the timeout cases are fast and
+   * deterministic; the classification and logging under test are the same
+   * code the 2500/6000ms defaults run.
+   */
+  const FAST_BUDGET = { shopApiTimeoutMs: 20, shopApiTotalBudgetMs: 60 };
+
+  it("still injects metadata, and says nothing, on the happy path", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ data: { name: "Test Bistro" } })),
+    );
+
+    const res = await request(app()).get("/shops/test-bistro");
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("Test Bistro");
+    // A warning on a working request would make the log useless as a signal.
+    expect(warnings).toEqual([]);
+  });
+
+  it("warns, naming the shop and the timeout, when the API never answers", async () => {
+    const fetchSpy = sleepingFetch();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const res = await request(app(FAST_BUDGET)).get("/shops/Fauget/menu");
+
+    // The page itself must still be served — losing the preview is acceptable,
+    // losing the shop's page is not.
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("<title>Gahezlak</title>");
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("/shops/Fauget/menu");
+    expect(warnings[0]).toContain("Fauget");
+    expect(warnings[0]).toContain("timeout");
+    expect(warnings[0]).toContain("generic <head>");
+  });
+
+  it("retries once, within the total budget, when the first attempt times out", async () => {
+    const fetchSpy = sleepingFetch();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await request(app(FAST_BUDGET)).get("/shops/Fauget");
+
+    // A cold Render instance often rejects fast and then answers; one retry
+    // inside the budget is what rescues that, and the log says how many ran.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(warnings[0]).toContain("2 attempt(s)");
+  });
+
+  it("does not retry when the total budget leaves no room", async () => {
+    const fetchSpy = sleepingFetch();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    // Budget exhausted by the first attempt: the ceiling is the promise made
+    // to a waiting scraper, and it outranks the retry.
+    await request(app({ shopApiTimeoutMs: 40, shopApiTotalBudgetMs: 40 })).get(
+      "/shops/Fauget",
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(warnings[0]).toContain("1 attempt(s)");
+  });
+
+  it("warns with the status when the API answers non-2xx, and retries a 5xx", async () => {
+    const fetchSpy = vi.fn(async () => jsonResponse(null, false, 502));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const res = await request(app(FAST_BUDGET)).get("/shops/Fauget");
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("<title>Gahezlak</title>");
+    expect(warnings[0]).toContain("http: HTTP 502");
+    // 502 is what Render's router emits while an instance is spinning up.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a 404 — the slug simply isn't a shop", async () => {
+    const fetchSpy = vi.fn(async () => jsonResponse(null, false, 404));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await request(app(FAST_BUDGET)).get("/shops/does-not-exist");
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(warnings[0]).toContain("HTTP 404");
+  });
+
+  it("distinguishes a connection failure from a timeout", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      }),
+    );
+
+    await request(app(FAST_BUDGET)).get("/shops/Fauget");
+
+    // "timed out" and "refused" have different fixes, so the log must not
+    // flatten them into one another.
+    expect(warnings[0]).toContain("network: ECONNREFUSED");
+    expect(warnings[0]).not.toContain("timeout:");
+  });
+
+  it("warns when the API answers 200 with nothing usable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ data: null })),
+    );
+
+    const res = await request(app()).get("/shops/ghost");
+
+    expect(res.status).toBe(200);
+    expect(warnings[0]).toContain("no usable data");
+  });
+
+  it("warns when the sitemap's shop list is unavailable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("ECONNREFUSED");
+      }),
+    );
+
+    const res = await request(app()).get("/sitemap.xml");
+
+    // A sitemap listing no shops looks identical to a site that has none.
+    expect(res.status).toBe(200);
+    expect(warnings[0]).toContain("/sitemap.xml");
+    expect(warnings[0]).toContain("ECONNREFUSED");
   });
 });
 

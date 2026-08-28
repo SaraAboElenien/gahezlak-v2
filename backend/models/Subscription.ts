@@ -75,6 +75,48 @@ export const Subscriptions = mongoose.model<ISubscription>(
 );
 
 /**
+ * How long a subscription still marked ACTIVE keeps working past its
+ * `currentPeriodEnd`.
+ *
+ * ACTIVE is gated on the clock like every other status, but the date it is
+ * gated on is advanced by an *external* event: Paymob's renewal webhook
+ * (`handleSubscriptionRenewed`) rewrites both period fields when a renewal
+ * settles. That makes an ungraced gate dangerous in the deny direction, in a
+ * way the TRIALING fix was not. Three paths in that handler return early
+ * *after* the customer has already been charged (plan row missing, unparseable
+ * renewal date, unrecognised plan frequency); `handleSubscriptionResumed` sets
+ * ACTIVE without touching the period at all; and webhook delivery is not
+ * guaranteed in the first place — this project has twice shipped with a
+ * webhook URL that was never set. Any one of those would otherwise take a
+ * fully paid-up restaurant off the air at midnight, which is a worse failure
+ * than the one being fixed here.
+ *
+ * So ACTIVE gets a grace window and TRIALING/CANCELLED deliberately do not.
+ * That asymmetry is the point rather than an oversight: nothing external is
+ * ever expected to move *their* dates. A trial's end is final, and a
+ * cancellation's end was already known at the moment it was written. Only
+ * ACTIVE is waiting on a message that might not arrive.
+ *
+ * Three days covers a dropped webhook plus a redeploy window without letting an
+ * abandoned subscription trade indefinitely. It does not need to cover Paymob's
+ * whole dunning cycle: Paymob suspends genuinely delinquent subscriptions, and
+ * that webhook writes EXPIRED — which no grace period admits.
+ */
+export const ACTIVE_GRACE_PERIOD_MS = 3 * 24 * 60 * 60 * 1000;
+
+/**
+ * The instant an ACTIVE subscription's `currentPeriodEnd` must still be after.
+ *
+ * Expressed as a shifted cutoff (`end > now - grace`) rather than a shifted end
+ * (`end + grace > now`) because those are algebraically identical and only the
+ * first can be handed to Mongo as a `$gt`. Both encodings below call this, so
+ * the window cannot drift between them.
+ */
+function activeGraceCutoff(now: Date): Date {
+  return new Date(now.getTime() - ACTIVE_GRACE_PERIOD_MS);
+}
+
+/**
  * The single definition of "may this shop use the service right now".
  *
  * Three call sites used to answer this question and disagreed, which composed
@@ -97,8 +139,13 @@ export function isEntitledToService(
   if (!subscription) return false;
 
   switch (subscription.status) {
+    // ACTIVE used to return `true` unconditionally, which is the same shape of
+    // bug the TRIALING branch below had: a subscription whose payment quietly
+    // stopped kept full access forever, because nothing in this codebase ever
+    // re-examines the clock and there is no scheduler of any kind. See
+    // ACTIVE_GRACE_PERIOD_MS for why this branch alone gets a grace window.
     case SubscriptionStatus.ACTIVE:
-      return true;
+      return subscription.currentPeriodEnd > activeGraceCutoff(now);
     // TRIALING is gated on the clock exactly as CANCELLED is. It used to
     // return `true` unconditionally, which meant a free trial never ended:
     // nothing anywhere transitions `trialing` -> `expired` (the only writer
@@ -134,9 +181,15 @@ export function isEntitledToService(
 export function entitledToServiceFilter(now: Date = new Date()) {
   return {
     $or: [
-      { status: SubscriptionStatus.ACTIVE },
-      // Mirrors the TRIALING/CANCELLED branch of isEntitledToService above —
-      // both are entitled only while their paid-for period is still running.
+      // Mirrors the ACTIVE branch of isEntitledToService above, grace window
+      // included — an ACTIVE row is entitled only while its period, extended
+      // by ACTIVE_GRACE_PERIOD_MS, is still running.
+      {
+        status: SubscriptionStatus.ACTIVE,
+        currentPeriodEnd: { $gt: activeGraceCutoff(now) },
+      },
+      // Mirrors the TRIALING/CANCELLED branch — both are entitled only while
+      // their paid-for period is still running, with no grace.
       {
         status: {
           $in: [SubscriptionStatus.TRIALING, SubscriptionStatus.CANCELLED],

@@ -12,7 +12,7 @@ import {
   PaginatedResponse,
 } from "../common/types/controller-response.types";
 import { IMenuItem } from "../models/MenuItem";
-import uploadToImgbb from "../utils/upload-to-imgbb";
+import { uploadImage } from "../utils/upload-image";
 import { requireUser } from "../utils/current-user";
 
 export const createMenuItemAndAddToCategoryHandler: RequestHandler<
@@ -34,8 +34,8 @@ export const createMenuItemAndAddToCategoryHandler: RequestHandler<
   let imageUrl: string | undefined;
 
   if (req.file) {
-    const uploadResult = await uploadToImgbb(req.file);
-    imageUrl = uploadResult?.data?.url;
+    const uploaded = await uploadImage(req.file);
+    imageUrl = uploaded.url;
   }
 
   const item = await createMenuItem(shopId, {
@@ -109,8 +109,8 @@ export const updateMenuItemHandler: RequestHandler<
   let imageUrl: string | undefined;
 
   if (req.file) {
-    const uploadResult = await uploadToImgbb(req.file);
-    imageUrl = uploadResult?.data?.url;
+    const uploaded = await uploadImage(req.file);
+    imageUrl = uploaded.url;
   }
 
   const updatedItem = await updateMenuItem(shopId, itemId, {

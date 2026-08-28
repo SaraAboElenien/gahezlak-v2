@@ -15,6 +15,7 @@ import { captureException } from "./config/sentry";
 import express from "express";
 import mongoose from "mongoose";
 import { httpLogger, logger } from "./config/pino";
+import { resolveTrustProxyHops } from "./config/trust-proxy";
 import authRoutes from "./routes/auth.routes";
 import userRoutes from "./routes/user.routes";
 import subscriptionRoutes from "./routes/subscription.routes";
@@ -50,6 +51,13 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const app = express();
+
+// MUST be set before any middleware that reads req.ip -- notably the rate
+// limiters, which key on it. Without this Express reports Render's local
+// proxy (127.0.0.1) as every client's address, so every user in the world
+// shared a single rate-limit bucket. See config/trust-proxy.ts for the
+// observed hop chain and for why this is a hop COUNT and never `true`.
+app.set("trust proxy", resolveTrustProxyHops());
 
 // Allowed browser origins for CORS. FRONTEND_URL must be set to the real
 // deployed frontend origin in production; localhost is only allowed outside

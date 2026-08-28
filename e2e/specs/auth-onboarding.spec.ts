@@ -73,19 +73,21 @@ test.describe("owner onboarding", () => {
 
     const shop = await control.shop(shopName);
     expect(shop.name).toBe(shopName);
-    expect(shop.qrCodeUrl).toBeTruthy();
 
-    // REGRESSION GUARD. `utils/qr-code-generator.ts` bakes FRONTEND_URL into
-    // the QR at creation time, so a shop created while that pointed somewhere
-    // else keeps a QR code that goes nowhere — permanently, and on printed
-    // material. A live shop shipped in exactly that state (its QR encoded
-    // http://localhost:5173). This asserts the bytes the app uploaded are the
-    // bytes the generator produces for the current origin.
-    const qr = await control.qrCheck(shopName);
-    expect(qr.menuUrl).toBe(
+    // REGRESSION GUARD, and the reason it is worth the cost of decoding a PNG:
+    // a shop's QR code goes onto printed table stickers, so encoding the wrong
+    // origin is not a bug anyone notices until the stickers are on the tables.
+    // A live shop shipped in exactly that state, its QR encoding
+    // http://localhost:5173, because the origin was baked in at creation time
+    // from whatever FRONTEND_URL happened to be then.
+    //
+    // The QR is now rendered on demand and reads FRONTEND_URL at call time, so
+    // this asserts the property that actually matters to a diner: point a
+    // phone at it and you land on THIS shop's menu, on THIS origin.
+    const menuUrl = await control.qrMenuUrl(shopName);
+    expect(menuUrl).toBe(
       `${new URL(page.url()).origin}/shops/${encodeURIComponent(shopName)}/menu`,
     );
-    expect(qr.matches).toBe(true);
   });
 
   test("an unverified account cannot log in", async ({ page, control }) => {

@@ -83,11 +83,12 @@ export const useRestaurantForm = (
         formData.append("logo", data.logo[0]);
       }
       await shopApi.UpdateShop(userData.shop._id, formData);
-      await shopApi.RegenerateQrCode({
-        width: 300,
-        margin: 1,
-        errorCorrectionLevel: "H",
-      });
+
+      // No QR regeneration call needed here any more: the QR image is
+      // rendered on demand from the shop's current name (see
+      // RestaurantSettings.tsx / shopApi.GetQrCodeImageUrl), so a rename
+      // saved above is reflected the next time it's fetched, with nothing to
+      // trigger explicitly.
 
       // Call success callback
       onSuccess?.();

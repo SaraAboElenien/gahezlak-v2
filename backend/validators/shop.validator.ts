@@ -67,27 +67,11 @@ export const updateShopValidator = [
   validate,
 ];
 
-export const validateRegenerateQRCode = [
-  // .toInt() matters as much as the bounds here: isInt() accepts the *string*
-  // "600" as valid, and the handler passes the value straight to QRCode as a
-  // pixel width. Without the sanitiser a well-formed request can still reach
-  // the encoder with a string where it expects a number.
-  body("width")
-    .optional()
-    .isInt({ min: 100, max: 1000 })
-    .withMessage("Width must be between 100 and 1000")
-    .toInt(),
-  body("margin")
-    .optional()
-    .isInt({ min: 0, max: 10 })
-    .withMessage("Margin must be between 0 and 10")
-    .toInt(),
-  body("errorCorrectionLevel")
-    .optional()
-    .isIn(["L", "M", "Q", "H"])
-    .withMessage("Error correction level must be L, M, Q, or H"),
-  validate,
-];
+// `validateRegenerateQRCode` (regenerate-with-custom-options) was removed
+// alongside `POST /shops/qr-code` — see shop.routes.ts. QR generation is now
+// on demand and always uses the fixed defaults in qr-code-generator.ts, so
+// there is no longer a caller-supplied width/margin/errorCorrectionLevel to
+// bound.
 
 export const shopNameParamValidator = [
   param("shopName").isString().withMessage("Shop name must be a string").trim(),

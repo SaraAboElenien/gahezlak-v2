@@ -4,43 +4,54 @@
  * application module is loaded.
  *
  * Why here rather than in the app: the app must not know it is under test.
- * `utils/upload-to-imgbb.ts`, `utils/paymob.ts` and `config/claude.ts` all
- * call bare `fetch`/the SDK against real hosts, and there is no env var that
+ * `utils/upload-image.ts`, `utils/paymob.ts` and `config/claude.ts` all call
+ * bare `fetch`/the SDK against real hosts, and there is no env var that
  * redirects them. Patching the global in the *test harness process* leaves
  * application code untouched while making the suite genuinely hermetic —
  * nothing leaves the machine, and no third-party account or key is needed.
  *
- * imgbb is the one that actually matters: `createShopHandler` unconditionally
- * generates a QR code and uploads it, so shop creation returns 500 without
- * this — which would make the entire signup -> create-shop journey untestable.
+ * The image host is the one that actually matters, and it is worth knowing
+ * WHICH host that is. It used to be imgbb, and the reason it no longer is is
+ * the whole point of stubbing at this layer: imgbb began rejecting every
+ * request from the deployed host's datacenter IP range, which broke shop
+ * creation and every image upload on the live site while every mocked unit
+ * test stayed green. Uploads now go to Cloudinary via a signed REST call in
+ * `utils/upload-image.ts`, so that is what is stubbed here. Attaching a photo
+ * to a menu item (see `owner-menu.spec.ts`) genuinely traverses that code
+ * path; without this stub it would fail.
  *
- * The final `else` is a deliberate tripwire: anything that is neither stubbed
- * nor local *fails loudly* instead of silently reaching the internet, so a
- * future integration cannot quietly make this suite non-hermetic.
+ * Note there is deliberately NO imgbb branch any more. If application code
+ * ever reaches for `api.imgbb.com` again it hits the tripwire below and fails
+ * loudly, rather than being quietly serviced by a stub for a host the app is
+ * supposed to have left behind.
+ *
+ * The final `else` is that tripwire: anything that is neither stubbed nor
+ * local *fails loudly* instead of silently reaching the internet, so a future
+ * integration cannot quietly make this suite non-hermetic.
  */
 
 type FetchInput = Parameters<typeof fetch>[0];
 
-/** Records what was handed to imgbb so specs can assert on it (see control.ts). */
-export interface ImgbbUpload {
-  /** The raw base64 payload the app uploaded. */
+/**
+ * Records what was handed to the image host so specs can assert on it (see
+ * control.ts's `/image-uploads`).
+ */
+export interface ImageUpload {
+  /** The full `data:<mime>;base64,<payload>` URI the app posted. */
+  dataUri: string;
+  /** Just the base64 payload, so a spec can compare it to the bytes it attached. */
   base64: string;
   at: number;
 }
 
-const imgbbUploads: ImgbbUpload[] = [];
+const imageUploads: ImageUpload[] = [];
 
-export function getImgbbUploads(): readonly ImgbbUpload[] {
-  return imgbbUploads;
+export function getImageUploads(): readonly ImageUpload[] {
+  return imageUploads;
 }
 
-export function clearImgbbUploads(): void {
-  imgbbUploads.length = 0;
-}
-
-/** Discards uploads recorded after `length` — see control.ts's /qr/check. */
-export function truncateImgbbUploads(length: number): void {
-  imgbbUploads.length = length;
+export function clearImageUploads(): void {
+  imageUploads.length = 0;
 }
 
 function urlOf(input: FetchInput): string {
@@ -58,6 +69,14 @@ function json(body: unknown, status = 200): Response {
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
 
+/**
+ * A 1x1 transparent GIF, returned as the "hosted" URL. A data: URI rather
+ * than a plausible-looking https one so the browser renders the image instead
+ * of logging a failed request for every card on the page.
+ */
+const HOSTED_IMAGE =
+  "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
 export function installExternalStubs(): void {
   const realFetch = globalThis.fetch;
 
@@ -71,29 +90,29 @@ export function installExternalStubs(): void {
       return realFetch(input as never, init);
     }
 
-    if (host === "api.imgbb.com") {
-      // The app posts FormData whose single "image" field is base64 PNG bytes.
+    if (host === "api.cloudinary.com") {
+      // `utils/upload-image.ts` posts FormData whose "file" field is a data
+      // URI built from the multer buffer, alongside api_key/timestamp/
+      // folder/signature. Only the file is worth recording.
       const body = init?.body;
-      let base64 = "";
+      let dataUri = "";
       if (typeof FormData !== "undefined" && body instanceof FormData) {
-        base64 = String(body.get("image") ?? "");
+        dataUri = String(body.get("file") ?? "");
       }
-      imgbbUploads.push({ base64, at: Date.now() });
+      const base64 = dataUri.includes(",") ? dataUri.split(",")[1] : "";
+      imageUploads.push({ dataUri, base64, at: Date.now() });
 
-      // Shape matches utils/upload-to-imgbb.ts's ImgbbUploadResponse. A data:
-      // URI is used rather than a fake http URL so the browser renders the
-      // image instead of logging a 404 for every card on the page.
-      const hosted =
-        "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+      // Shape matches what utils/upload-image.ts reads: it requires BOTH
+      // `secure_url` and `public_id`, and deliberately ignores `url` (http)
+      // because the frontend's CSP forbids mixed content. Returning a
+      // response missing either field would make the uploader throw, which is
+      // correct behaviour on its part and would look like a broken test here.
       return json({
-        success: true,
-        status: 200,
-        data: {
-          id: `e2e-${imgbbUploads.length}`,
-          url: hosted,
-          display_url: hosted,
-          delete_url: hosted,
-        },
+        secure_url: HOSTED_IMAGE,
+        url: HOSTED_IMAGE,
+        public_id: `gahezlak/e2e-${imageUploads.length}`,
+        format: "gif",
+        resource_type: "image",
       });
     }
 

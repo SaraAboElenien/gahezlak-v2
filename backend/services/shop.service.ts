@@ -2,10 +2,6 @@ import { IShop, Shops } from "../models/Shop";
 import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
 import mongoose, { FilterQuery, ProjectionFields, SortOrder } from "mongoose";
-import {
-  generateAndUploadMenuQRCode,
-  QRCodeOptions,
-} from "../utils/qr-code-generator";
 import { Users } from "../models/User";
 import { Roles } from "../models/Role";
 import { hash } from "bcryptjs";
@@ -16,19 +12,29 @@ import { isAssignableMemberRole } from "./role.service";
 
 /**
  * Fields shop creation is permitted to set — every field the "create my
- * restaurant" form submits, plus `qrCodeUrl`/`logoUrl`, which
- * `createShopHandler` derives itself (a freshly generated QR code, and an
- * imgbb upload) rather than taking from the request body.
+ * restaurant" form submits, plus `logoUrl`, which `createShopHandler` derives
+ * itself (an imgbb upload) rather than taking from the request body.
+ *
+ * `qrCodeUrl` is deliberately NOT here (as of 2026-08-24). The QR code used
+ * to be generated once at creation and uploaded to imgbb, with the returned
+ * URL stored here — which baked the encoded menu URL in at that one moment
+ * (see `utils/qr-code-generator.ts`) and depended on imgbb, which started
+ * refusing requests from the deployed host entirely. Shop creation no longer
+ * generates or stores a QR code image at all; `GET
+ * /shops/name/:shopName/qr-code.png` renders one on demand from the shop's
+ * *current* name, so there is nothing to write here. `Shop.qrCodeUrl` still
+ * exists on the schema only so old rows (dead `i.ibb.co` URLs) don't fail
+ * validation; nothing reads it any more.
  *
  * This allowlist is the security control, not a tidiness measure, for the
  * same reason `UPDATABLE_SHOP_FIELDS` below is one: the `Pick<IShop, ...>`
  * parameter type is a compile-time constraint only. `createShopHandler`
  * builds the object it actually hands this function as
- * `{ ...req.body, qrCodeUrl, logoUrl }`, and TypeScript's structural typing
- * does nothing to strip properties an incoming JSON body happens to carry
- * beyond the ones the type names — the same gap `pickUpdatableShopFields`
- * closes for updates. `Shop` also declares `subscriptionId` (written only by
- * the Paymob webhook once a real subscription exists — see
+ * `{ ...req.body, logoUrl }`, and TypeScript's structural typing does
+ * nothing to strip properties an incoming JSON body happens to carry beyond
+ * the ones the type names — the same gap `pickUpdatableShopFields` closes for
+ * updates. `Shop` also declares `subscriptionId` (written only by the Paymob
+ * webhook once a real subscription exists — see
  * `payment.webhook.controller.ts`) and `isPaymentDone`, neither of which a
  * shop-creation form should ever set.
  *
@@ -50,7 +56,6 @@ const CREATABLE_SHOP_FIELDS = [
   "address",
   "phoneNumber",
   "email",
-  "qrCodeUrl",
   "logoUrl",
 ] as const satisfies readonly (keyof IShop)[];
 
@@ -71,13 +76,7 @@ function pickCreatableShopFields(shopData: Partial<IShop>): Partial<IShop> {
 async function createShop(
   shopData: Pick<
     IShop,
-    | "name"
-    | "type"
-    | "address"
-    | "phoneNumber"
-    | "email"
-    | "qrCodeUrl"
-    | "logoUrl"
+    "name" | "type" | "address" | "phoneNumber" | "email" | "logoUrl"
   >,
   currentUserId: string,
 ) {
@@ -140,7 +139,6 @@ async function getShop({
     select = {
       name: 1,
       logoUrl: 1,
-      qrCodeUrl: 1,
       type: 1,
       address: 1,
     };
@@ -260,31 +258,6 @@ async function getAllShops({
   const shops = await Shops.find(filter).sort(sort).skip(skip).limit(limit);
   const total = await Shops.countDocuments(filter);
   return { shops, total };
-}
-
-/**
- * Regenerate QR code for shop
- */
-async function regenerateShopQRCode(
-  shopId: string,
-  options: QRCodeOptions = {},
-): Promise<{ qrCodeUrl: string; menuUrl: string }> {
-  const shop = await Shops.findById(shopId);
-  if (!shop) {
-    throw new Errors.NotFoundError(errMsg.SHOP_NOT_FOUND);
-  }
-
-  const qrCodeResult = await generateAndUploadMenuQRCode(
-    shop.name,
-    undefined,
-    options,
-  );
-
-  // Update shop with new QR code URL
-  shop.qrCodeUrl = qrCodeResult.qrCodeUrl;
-  await shop.save();
-
-  return qrCodeResult;
 }
 
 async function getShopMembers(shopId: string) {
@@ -510,7 +483,6 @@ export {
   getAllShops,
   deleteShop,
   getUserShop,
-  regenerateShopQRCode,
   removeMemberFromShop,
   updateMemberRole,
   getShopById,

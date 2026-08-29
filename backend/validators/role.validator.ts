@@ -1,6 +1,17 @@
-import { body } from "express-validator";
+import { body, param } from "express-validator";
 import { validate } from "../middlewares/validators";
 import { Role } from "../models/Role";
+
+/**
+ * Shared by every `/roles/:id` route. Admin-only, so lower severity than the
+ * public plan route — but a malformed id still became a CastError and therefore
+ * a 500 rather than a 422, and the update and delete paths now read the role
+ * before acting, so they hit it too.
+ */
+export const roleIdParamValidator = [
+  param("id").isMongoId().withMessage("Invalid role ID"),
+  validate,
+];
 
 export const createRoleValidator = [
   body("name")

@@ -5,7 +5,6 @@ import {
   disconnectTestDB,
   clearTestDB,
 } from "../db-test-helper";
-import { Subscriptions, SubscriptionStatus } from "../../models/Subscription";
 import { Plans } from "../../models/Plan";
 import { Shops } from "../../models/Shop";
 import { Orders, OrderStatus } from "../../models/Order";
@@ -15,6 +14,11 @@ import {
   getTopPerformingRestaurants,
 } from "../../services/admin-analytics.service";
 import { getPlatformTimeZoneOffsetMs } from "../../utils/report-date-window";
+import {
+  PaymentTransactions,
+  PaymentTransactionKind,
+} from "../../models/PaymentTransaction";
+import { recordSettledTransaction } from "../../services/payment-ledger.service";
 
 /**
  * The admin analytics service answers three questions for the platform owner:
@@ -67,29 +71,6 @@ async function seedShop(name?: string) {
   });
 }
 
-async function seedSubscription(opts: {
-  price?: number;
-  status?: SubscriptionStatus;
-  currentPeriodStart?: Date;
-  currentPeriodEnd?: Date;
-  /** Point `plan` at nothing, to exercise the unpopulated branch. */
-  danglingPlan?: boolean;
-}) {
-  const plan = opts.danglingPlan
-    ? new mongoose.Types.ObjectId()
-    : (await seedPlan(opts.price ?? 299))._id;
-  const shop = await seedShop();
-
-  return Subscriptions.create({
-    userId: new mongoose.Types.ObjectId(),
-    shop: shop._id,
-    plan,
-    status: opts.status ?? SubscriptionStatus.ACTIVE,
-    currentPeriodStart: opts.currentPeriodStart ?? new Date("2026-08-01"),
-    currentPeriodEnd: opts.currentPeriodEnd ?? new Date("2026-08-29"),
-  });
-}
-
 async function seedOrder(opts: {
   shopId: mongoose.Types.ObjectId;
   totalAmount: number;
@@ -127,6 +108,28 @@ async function seedOrder(opts: {
   return order;
 }
 
+/**
+ * A settled charge in the ledger. Revenue is now read from here rather than
+ * re-derived from subscription state, so this is what the revenue tests seed.
+ */
+async function seedLedger(opts: {
+  amount: number;
+  kind?: PaymentTransactionKind;
+  settledAt?: Date;
+  planId?: mongoose.Types.ObjectId;
+  shopId?: mongoose.Types.ObjectId;
+}) {
+  return PaymentTransactions.create({
+    kind: opts.kind ?? PaymentTransactionKind.SUBSCRIPTION_INITIAL,
+    shopId: opts.shopId ?? new mongoose.Types.ObjectId(),
+    planId: opts.planId,
+    amount: opts.amount,
+    // paymobTransactionId is uniquely indexed, so every fixture needs its own.
+    paymobTransactionId: 700000 + nextSeq(),
+    settledAt: opts.settledAt ?? new Date("2026-08-15T12:00:00.000Z"),
+  });
+}
+
 beforeAll(async () => {
   await connectTestDB();
 });
@@ -138,133 +141,117 @@ afterAll(async () => {
 beforeEach(async () => {
   await clearTestDB();
 });
-
+/**
+ * REWRITTEN 2026-08-29 for the settled-transaction ledger (ADR-018).
+ *
+ * These tests used to seed subscriptions and assert over their plan prices.
+ * That is no longer what the function reads, and the change is not cosmetic:
+ * the old behaviour derived revenue from *current state*, so editing a plan's
+ * price rewrote history and a still-running subscription counted for nothing.
+ * The old suite encoded that second point as a CHARACTERISATION test
+ * asserting the wrong answer on purpose; it is inverted into a real
+ * assertion below.
+ */
 describe("getTotalPlatformRevenue", () => {
-  it("sums the plan price of every active subscription", async () => {
-    await seedSubscription({ price: 299 });
-    await seedSubscription({ price: 599 });
+  it("sums subscription charges that settled inside the window", async () => {
+    await seedLedger({ amount: 299 });
+    await seedLedger({
+      amount: 599,
+      kind: PaymentTransactionKind.SUBSCRIPTION_RENEWAL,
+    });
 
     await expect(getTotalPlatformRevenue("", "")).resolves.toBe(898);
   });
 
-  it("counts only `active` subscriptions — trialing, pending, cancelled and expired are not revenue", async () => {
-    await seedSubscription({ price: 299, status: SubscriptionStatus.ACTIVE });
-    await seedSubscription({
-      price: 1000,
-      status: SubscriptionStatus.TRIALING,
-    });
-    await seedSubscription({ price: 2000, status: SubscriptionStatus.PENDING });
-    await seedSubscription({
-      price: 4000,
-      status: SubscriptionStatus.CANCELLED,
-    });
-    await seedSubscription({ price: 8000, status: SubscriptionStatus.EXPIRED });
+  it("EXCLUDES order payments - that money belongs to the restaurant, not the platform", async () => {
+    // The single most damaging way to get this wrong. Order payments dwarf
+    // subscription income, so counting them would overstate the platform by
+    // roughly the entire GMV, and the number would still look plausible.
+    await seedLedger({ amount: 299 });
+    await seedLedger({ amount: 100000, kind: PaymentTransactionKind.ORDER });
 
     await expect(getTotalPlatformRevenue("", "")).resolves.toBe(299);
   });
 
-  it("returns 0, not NaN, when there are no subscriptions at all", async () => {
+  it("counts a subscription charge that settled in the window even though the subscription is still running", async () => {
+    // THE HEADLINE FIX. Under the old containment filter this returned 0: a
+    // monthly subscription renewed on the 1st has `currentPeriodEnd` in the
+    // following month, so "revenue in August" excluded every subscription
+    // that was actually alive in August - i.e. all the real ones. A
+    // settlement date is a fact about a transaction and does not move, so the
+    // question stops arising rather than being answered better.
+    await seedLedger({
+      amount: 299,
+      settledAt: new Date("2026-08-15T10:00:00.000Z"),
+    });
+
+    await expect(
+      getTotalPlatformRevenue("2026-08-01", "2026-08-31"),
+    ).resolves.toBe(299);
+  });
+
+  it("does not rewrite history when a plan's price changes afterwards", async () => {
+    // The old implementation read `plan.price` at query time, so raising a
+    // plan's price retroactively inflated every past month that plan had
+    // appeared in. The ledger stores the amount actually charged.
+    const plan = await seedPlan(299);
+    await seedLedger({ amount: 299, planId: plan._id });
+
+    await Plans.updateOne({ _id: plan._id }, { $set: { price: 4999 } });
+
+    await expect(getTotalPlatformRevenue("", "")).resolves.toBe(299);
+  });
+
+  it("counts a redelivered webhook once, not twice", async () => {
+    // Paymob retries any webhook it did not get a 200 for.
+    // `paymobTransactionId` is uniquely indexed precisely so a redelivery
+    // cannot inflate revenue, and `recordSettledTransaction` swallows the
+    // resulting duplicate-key error rather than surfacing it.
+    const twice = {
+      kind: PaymentTransactionKind.SUBSCRIPTION_RENEWAL,
+      shopId: new mongoose.Types.ObjectId(),
+      amount: 299,
+      paymobTransactionId: 999111,
+      settledAt: new Date("2026-08-15"),
+    };
+    await recordSettledTransaction(twice);
+    await recordSettledTransaction(twice);
+
+    await expect(getTotalPlatformRevenue("", "")).resolves.toBe(299);
+    await expect(PaymentTransactions.countDocuments()).resolves.toBe(1);
+  });
+
+  it("returns 0, not NaN, when nothing has ever settled", async () => {
     const total = await getTotalPlatformRevenue("", "");
 
     expect(total).toBe(0);
     expect(Number.isNaN(total)).toBe(false);
   });
 
-  it("scores a dangling plan reference as 0 rather than NaN", async () => {
-    // populate() resolves a missing reference to null. Reading `.price` off it
-    // unguarded would put NaN into the platform revenue figure — and NaN is
-    // contagious, so one orphaned subscription would erase the whole number.
-    await seedSubscription({ price: 500 });
-    await seedSubscription({ danglingPlan: true });
-
-    const total = await getTotalPlatformRevenue("", "");
-
-    expect(total).toBe(500);
-    expect(Number.isNaN(total)).toBe(false);
-  });
-
   it("ignores the date filter entirely unless BOTH dates are supplied", async () => {
-    await seedSubscription({
-      price: 299,
-      currentPeriodStart: new Date("2020-01-01"),
-      currentPeriodEnd: new Date("2020-01-31"),
-    });
+    await seedLedger({ amount: 299, settledAt: new Date("2020-01-15") });
 
-    // Only one half of the range: the guard is `startDate && endDate`, so a
-    // half-specified range is silently a no-op rather than a half-filter.
+    // The guard is `startDate && endDate`, so a half-specified range is a
+    // no-op rather than a half-filter.
     await expect(getTotalPlatformRevenue("2026-01-01", "")).resolves.toBe(299);
     await expect(getTotalPlatformRevenue("", "2026-01-01")).resolves.toBe(299);
   });
 
-  it("includes a subscription whose period sits exactly on the requested calendar-day boundaries", async () => {
-    // `currentPeriodStart` sits exactly on the inclusive UTC-midnight start
-    // of "2026-08-01", and `currentPeriodEnd` at UTC midnight on
-    // "2026-08-31" is well before the window's real (Cairo, exclusive)
-    // close — see the Cairo-day-boundary tests below for the precise edge.
-    await seedSubscription({
-      price: 299,
-      currentPeriodStart: new Date("2026-08-01T00:00:00.000Z"),
-      currentPeriodEnd: new Date("2026-08-31T00:00:00.000Z"),
-    });
-
-    await expect(
-      getTotalPlatformRevenue("2026-08-01", "2026-08-31"),
-    ).resolves.toBe(299);
-  });
-
-  it("excludes a subscription whose period falls outside the window", async () => {
-    await seedSubscription({
-      price: 299,
-      currentPeriodStart: new Date("2026-08-05"),
-      currentPeriodEnd: new Date("2026-08-20"),
-    });
+  it("excludes a charge that settled outside the window", async () => {
+    await seedLedger({ amount: 299, settledAt: new Date("2026-08-15") });
 
     await expect(
       getTotalPlatformRevenue("2026-09-01", "2026-09-30"),
     ).resolves.toBe(0);
   });
 
-  /**
-   * DEFECT (characterised, deliberately not changed here — see the report).
-   *
-   * The window filter is *containment*, not *overlap*: it demands
-   * `currentPeriodStart >= start AND currentPeriodEnd <= end`. A monthly
-   * subscription that renewed on the 1st has `currentPeriodEnd` in the *next*
-   * month, so asking "how much revenue in August" excludes every subscription
-   * that is still running — i.e. all of the live ones. The number the admin
-   * dashboard shows for the current month is therefore ~0 by construction.
-   *
-   * Changing it to overlap semantics is a product decision about what
-   * "revenue in a window" means for a subscription that straddles it, so this
-   * test pins the behaviour rather than asserting the desired one.
-   */
-  it("CHARACTERISATION: containment semantics exclude a subscription that is still running at the window end", async () => {
-    await seedSubscription({
-      price: 299,
-      currentPeriodStart: new Date("2026-08-01"),
-      currentPeriodEnd: new Date("2026-09-01"), // renews next month
-    });
-
-    await expect(
-      getTotalPlatformRevenue("2026-08-01", "2026-08-31"),
-    ).resolves.toBe(0);
-  });
-
-  /**
-   * REGRESSION (was a DEFECT — see TECH_DEBT.md and DECISIONS.md, fixed
-   * 2026-08-24). The frontend sends calendar dates (`formatDateYMD` →
-   * "2026-08-31"). The window is now computed as a half-open
-   * PLATFORM_TIMEZONE ("Africa/Cairo") range — [start-of-Cairo-day,
-   * start-of-next-Cairo-day) — rather than `new Date("2026-08-31")`
-   * (midnight UTC) compared with `$lte`, so a period ending later on the
-   * final *Cairo* day is included instead of being cut off at the very
-   * start of that day.
-   */
-  it("includes a subscription whose period ends later on the final Cairo day of the window", async () => {
-    await seedSubscription({
-      price: 299,
-      currentPeriodStart: new Date("2026-08-01T00:00:00.000Z"),
-      currentPeriodEnd: new Date("2026-08-31T09:00:00.000Z"), // same Cairo day, later
+  it("includes a charge that settled later on the final Cairo day of the window", async () => {
+    // The window closes at the start of the *next* Cairo day, not at UTC
+    // midnight on the named one. Getting this wrong silently drops the whole
+    // final day of every report - a bug this project has already shipped.
+    await seedLedger({
+      amount: 299,
+      settledAt: new Date("2026-08-31T09:00:00.000Z"),
     });
 
     await expect(
@@ -272,22 +259,17 @@ describe("getTotalPlatformRevenue", () => {
     ).resolves.toBe(299);
   });
 
-  it("excludes a subscription whose period ends only after the window's final Cairo day", async () => {
-    // The window for endDate "2026-08-31" now closes at the start of the
-    // *next* Cairo calendar day (2026-09-01 00:00 Africa/Cairo). A period
-    // ending after that instant is genuinely outside the window, not a
-    // truncation bug — this is the "still excludes something" half of the
-    // fix, so the test can't pass by simply matching everything.
+  it("excludes a charge that settled only after the window's final Cairo day", async () => {
+    // The "still excludes something" half, so the test above cannot pass by
+    // simply matching everything.
     const cairoOffsetMs = getPlatformTimeZoneOffsetMs(
       new Date("2026-09-01T00:00:00.000Z"),
     );
     const windowEndUtc = new Date(Date.UTC(2026, 8, 1) - cairoOffsetMs);
-    const justAfterWindowEnd = new Date(windowEndUtc.getTime() + 1);
 
-    await seedSubscription({
-      price: 299,
-      currentPeriodStart: new Date("2026-08-01T00:00:00.000Z"),
-      currentPeriodEnd: justAfterWindowEnd,
+    await seedLedger({
+      amount: 299,
+      settledAt: new Date(windowEndUtc.getTime() + 1),
     });
 
     await expect(
@@ -296,26 +278,63 @@ describe("getTotalPlatformRevenue", () => {
   });
 
   it("rejects an unparseable date instead of failing deep inside the driver", async () => {
-    await seedSubscription({ price: 299 });
+    await seedLedger({ amount: 299 });
 
     // The admin routes carry no validator, so this is reachable from the wire.
-    // Before the fix this surfaced as a raw Mongoose CastError — a 500 whose
-    // message names an internal schema path.
     await expect(
       getTotalPlatformRevenue("not-a-date", "2026-08-31"),
     ).rejects.toMatchObject({ statusCode: 400 });
   });
 });
 
+describe("recordSettledTransaction", () => {
+  it("never throws when the insert fails, because the money has already moved", async () => {
+    // The caller is a webhook handler that has already activated a
+    // subscription or confirmed an order. Failing it would make Paymob retry
+    // a handler that is not idempotent, in order to protect a reporting row.
+    // Losing the row is the lesser harm, so the failure is logged, not raised.
+    await expect(
+      recordSettledTransaction({
+        kind: PaymentTransactionKind.SUBSCRIPTION_RENEWAL,
+        shopId: new mongoose.Types.ObjectId(),
+        // `amount` is `min: 0`, so a negative value fails schema validation.
+        amount: -1,
+        paymobTransactionId: 555000,
+        settledAt: new Date(),
+      }),
+    ).resolves.toBeUndefined();
+
+    await expect(PaymentTransactions.countDocuments()).resolves.toBe(0);
+  });
+
+  it("defaults the currency to EGP rather than leaving it unset", async () => {
+    await recordSettledTransaction({
+      kind: PaymentTransactionKind.SUBSCRIPTION_INITIAL,
+      shopId: new mongoose.Types.ObjectId(),
+      amount: 299,
+      paymobTransactionId: 555001,
+      settledAt: new Date(),
+    });
+
+    const row = await PaymentTransactions.findOne({
+      paymobTransactionId: 555001,
+    });
+    expect(row?.currency).toBe("EGP");
+  });
+});
+
+/**
+ * Growth is computed from two calls to getTotalPlatformRevenue, so these
+ * seed the ledger rather than subscriptions. The dates that used to be a
+ * subscription period are now a single settlement instant, which is the
+ * whole point of ADR-018: a charge belongs to the window it settled in,
+ * not to whichever window happens to contain a billing period.
+ */
 describe("getRevenueGrowthRate", () => {
   const emptyWindow = ["2020-01-01", "2020-01-02"] as const;
 
   it("reports 100% growth when the earlier period earned nothing and the later one earned something", async () => {
-    await seedSubscription({
-      price: 299,
-      currentPeriodStart: new Date("2026-08-01"),
-      currentPeriodEnd: new Date("2026-08-20"),
-    });
+    await seedLedger({ amount: 299, settledAt: new Date("2026-08-01") });
 
     const growth = await getRevenueGrowthRate(
       ...emptyWindow,
@@ -338,16 +357,8 @@ describe("getRevenueGrowthRate", () => {
   });
 
   it("computes a positive growth percentage between two funded periods", async () => {
-    await seedSubscription({
-      price: 200,
-      currentPeriodStart: new Date("2026-07-02"),
-      currentPeriodEnd: new Date("2026-07-20"),
-    });
-    await seedSubscription({
-      price: 300,
-      currentPeriodStart: new Date("2026-08-02"),
-      currentPeriodEnd: new Date("2026-08-20"),
-    });
+    await seedLedger({ amount: 200, settledAt: new Date("2026-07-02") });
+    await seedLedger({ amount: 300, settledAt: new Date("2026-08-02") });
 
     const growth = await getRevenueGrowthRate(
       "2026-07-01",
@@ -360,16 +371,8 @@ describe("getRevenueGrowthRate", () => {
   });
 
   it("reports a negative percentage when revenue falls", async () => {
-    await seedSubscription({
-      price: 400,
-      currentPeriodStart: new Date("2026-07-02"),
-      currentPeriodEnd: new Date("2026-07-20"),
-    });
-    await seedSubscription({
-      price: 100,
-      currentPeriodStart: new Date("2026-08-02"),
-      currentPeriodEnd: new Date("2026-08-20"),
-    });
+    await seedLedger({ amount: 400, settledAt: new Date("2026-07-02") });
+    await seedLedger({ amount: 100, settledAt: new Date("2026-08-02") });
 
     const growth = await getRevenueGrowthRate(
       "2026-07-01",
@@ -382,11 +385,7 @@ describe("getRevenueGrowthRate", () => {
   });
 
   it("reports -100% when a funded period is followed by an empty one", async () => {
-    await seedSubscription({
-      price: 400,
-      currentPeriodStart: new Date("2026-07-02"),
-      currentPeriodEnd: new Date("2026-07-20"),
-    });
+    await seedLedger({ amount: 400, settledAt: new Date("2026-07-02") });
 
     const growth = await getRevenueGrowthRate(
       "2026-07-01",
@@ -605,13 +604,19 @@ describe("getTopPerformingRestaurants", () => {
   });
 
   /**
-   * CHARACTERISATION. `$lookup` + `$unwind` (without
-   * `preserveNullAndEmptyArrays`) is an inner join: revenue belonging to a shop
-   * whose document has since been deleted vanishes from the platform total
-   * rather than showing as "Unknown". Pinned so a future change to the join is
-   * a deliberate one.
+   * REGRESSION (was a CHARACTERISATION pinning the defect — fixed 2026-08-29).
+   *
+   * `$lookup` + `$unwind` without `preserveNullAndEmptyArrays` is an inner
+   * join, because `$unwind` over an empty array DROPS the document. Revenue
+   * belonging to a shop whose document has since been deleted therefore
+   * vanished from the ranking entirely, and the admin saw a total that did not
+   * reconcile with the orders actually in the database — silently, and in the
+   * flattering direction where nobody files a bug.
+   *
+   * Failing to *name* a deleted shop is acceptable; failing to *count* its
+   * money is not. The row now survives with a null name.
    */
-  it("CHARACTERISATION: drops revenue whose shop document no longer exists", async () => {
+  it("keeps revenue whose shop document no longer exists, rather than dropping it", async () => {
     const ghost = new mongoose.Types.ObjectId();
     const live = await seedShop("Still Here");
     await seedOrder({
@@ -631,7 +636,9 @@ describe("getTopPerformingRestaurants", () => {
       "2026-08-20",
     );
 
+    // Ordered by revenue, so the orphaned 900 leads.
     expect(top).toEqual([
+      { shopId: ghost, shopName: null, totalShopRevenue: 900 },
       { shopId: live._id, shopName: "Still Here", totalShopRevenue: 10 },
     ]);
   });

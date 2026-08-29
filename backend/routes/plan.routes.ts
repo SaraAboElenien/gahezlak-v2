@@ -6,6 +6,7 @@ import {
   createPlanValidator,
   updatePlanValidator,
   activateOrDeactivatePlanValidator,
+  planIdParamValidator,
 } from "../validators/plan.validator";
 
 const planRoutes = Router();
@@ -18,11 +19,12 @@ planRoutes.post(
   controllers.createPlanHandler,
 );
 planRoutes.get("/", controllers.getPlansHandler);
-planRoutes.get("/:id", controllers.getPlanById);
+planRoutes.get("/:id", planIdParamValidator, controllers.getPlanById);
 planRoutes.put(
   "/:id",
   protect,
   isAllowed([Role.ADMIN]),
+  planIdParamValidator,
   updatePlanValidator,
   controllers.updatePlanHandler,
 );
@@ -30,6 +32,7 @@ planRoutes.patch(
   "/:id/activate",
   protect,
   isAllowed([Role.ADMIN]),
+  planIdParamValidator,
   activateOrDeactivatePlanValidator,
   controllers.activateOrDeactivatePlanHandler,
 );

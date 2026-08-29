@@ -90,6 +90,12 @@ let userRoleId: Types.ObjectId;
 
 const PLAIN_PASSWORD = "OldPass123!";
 
+type OtpSlotFixture = {
+  code: string | null;
+  expireAt: Date | null;
+  reason: string | null;
+};
+
 async function seedUser(
   overrides: {
     email?: string;
@@ -102,11 +108,12 @@ async function seedUser(
     newEmail?: string | null;
     role?: Types.ObjectId;
     shop?: Types.ObjectId;
-    verificationCode?: {
-      code: string | null;
-      expireAt: Date | null;
-      reason: string | null;
-    };
+    // One slot per OTP flow (see models/User.ts). Fixtures name the slot they
+    // mean; a test that writes the wrong one is testing nothing, since each
+    // consumer reads only its own.
+    verificationCode?: OtpSlotFixture;
+    passwordResetCode?: OtpSlotFixture;
+    emailChangeCode?: OtpSlotFixture;
     createdAt?: Date;
   } = {},
 ) {
@@ -188,8 +195,10 @@ describe("requestEmailChange", () => {
     // Still the old address until the code is confirmed — a pending request
     // must not move the identifier anyone logs in with.
     expect(stored.email).toBe("current@example.com");
-    expect(stored.verificationCode.code).toMatch(/^[a-zA-Z0-9]{6}$/);
-    expect(stored.verificationCode.reason).toBe("email_change");
+    // `emailChangeCode`, its own slot: writing here no longer destroys a
+    // signup or password-reset code the same person is holding.
+    expect(stored.emailChangeCode.code).toMatch(/^[a-zA-Z0-9]{6}$/);
+    expect(stored.emailChangeCode.reason).toBe("email_change");
     expect(result.message).toContain("confirmation code");
 
     // The delivery address is the whole security property of this endpoint.
@@ -199,7 +208,39 @@ describe("requestEmailChange", () => {
     expect(sendEmailMock).toHaveBeenCalledTimes(1);
     const [to, , html] = sendEmailMock.mock.calls[0];
     expect(to).toBe("new@example.com");
-    expect(html).toContain(stored.verificationCode.code);
+    expect(html).toContain(stored.emailChangeCode.code);
+  });
+
+  it("leaves the other two OTP flows untouched", async () => {
+    // The bug the slot split exists to fix, from this endpoint's side. All
+    // three flows used to write one `verificationCode` sub-document, so
+    // starting an email change silently invalidated a signup code or a
+    // password-reset code that was already in the person's inbox — with
+    // nothing to tell them, and the natural response (request another) being
+    // what caused it.
+    const { requestEmailChange } = await userService();
+    const outstanding = {
+      code: "111111",
+      expireAt: new Date(Date.now() + TEN_MINUTES),
+      reason: "account_verification",
+    };
+    const reset = {
+      code: "222222",
+      expireAt: new Date(Date.now() + TEN_MINUTES),
+      reason: "password_reset",
+    };
+    const user = await seedUser({
+      verificationCode: outstanding,
+      passwordResetCode: reset,
+    });
+
+    await requestEmailChange(user._id.toString(), "new@example.com");
+
+    const stored = await readUser(user._id);
+    expect(stored.verificationCode.code).toBe("111111");
+    expect(stored.verificationCode.reason).toBe("account_verification");
+    expect(stored.passwordResetCode.code).toBe("222222");
+    expect(stored.passwordResetCode.reason).toBe("password_reset");
   });
 
   it("expires the code in 10 minutes", async () => {
@@ -211,7 +252,7 @@ describe("requestEmailChange", () => {
     const after = Date.now();
 
     const stored = await readUser(user._id);
-    const expireAt = new Date(stored.verificationCode.expireAt!).getTime();
+    const expireAt = new Date(stored.emailChangeCode.expireAt!).getTime();
     expect(expireAt).toBeGreaterThanOrEqual(before + TEN_MINUTES);
     expect(expireAt).toBeLessThanOrEqual(after + TEN_MINUTES);
   });
@@ -246,7 +287,7 @@ describe("requestEmailChange", () => {
     // caller has just been told they may not have.
     const stored = await readUser(user._id);
     expect(stored.newEmail).toBeFalsy();
-    expect(stored.verificationCode.code).toBeNull();
+    expect(stored.emailChangeCode.code).toBeNull();
     expect(sendEmailMock).not.toHaveBeenCalled();
   });
 
@@ -276,13 +317,20 @@ describe("requestEmailChange", () => {
 
     expect(err.message).toBe(errMsg.FAILED_TO_SEND_EMAIL.en);
     expect(err.statusCode).toBe(400);
-    // Documented current behaviour, not an endorsement: the pending change is
-    // saved *before* the mail is attempted, so a delivery failure leaves a
-    // code the user was never shown. Harmless — it expires, the address has
-    // not moved, and re-requesting overwrites it — but it is why the caller
-    // must not read a 400 here as "nothing happened".
+    // A 400 here now genuinely means "nothing happened". The mail is attempted
+    // BEFORE the write, so a relay outage leaves no residue: previously the
+    // request was persisted first and the throw came after, so the account was
+    // left advertising a pending change to an address the person had not
+    // confirmed, with a live OTP they were never shown and no way to cancel it
+    // — nothing in the app clears a pending change.
+    //
+    // The code is generated in memory, so nothing needs to exist in the
+    // database for the mail to be correct; sending first inverts the residue
+    // to the recoverable direction (a code that simply does not work, which
+    // the user can act on by retrying).
     const stored = await readUser(user._id);
-    expect(stored.newEmail).toBe("new@example.com");
+    expect(stored.newEmail).toBeFalsy();
+    expect(stored.emailChangeCode.code).toBeNull();
   });
 });
 
@@ -299,7 +347,7 @@ describe("confirmEmailChange", () => {
     return seedUser({
       email: overrides.email ?? "current@example.com",
       newEmail: overrides.newEmail ?? "new@example.com",
-      verificationCode: {
+      emailChangeCode: {
         code: overrides.code ?? "123456",
         expireAt: overrides.expireAt ?? new Date(Date.now() + TEN_MINUTES),
         reason: overrides.reason ?? "email_change",
@@ -317,9 +365,36 @@ describe("confirmEmailChange", () => {
     const stored = await readUser(user._id);
     expect(stored.email).toBe("new@example.com");
     expect(stored.newEmail).toBeFalsy();
-    expect(stored.verificationCode.code).toBeNull();
-    expect(stored.verificationCode.reason).toBeNull();
-    expect(stored.verificationCode.expireAt).toBeNull();
+    expect(stored.emailChangeCode.code).toBeNull();
+    expect(stored.emailChangeCode.reason).toBeNull();
+    expect(stored.emailChangeCode.expireAt).toBeNull();
+  });
+
+  it("consumes only its own slot", async () => {
+    // Clearing has to be as narrowly scoped as writing, or the split buys
+    // nothing: confirming an email change must not also revoke a password
+    // reset the person requested in the meantime.
+    const { confirmEmailChange } = await userService();
+    const user = await seedUser({
+      email: "current@example.com",
+      newEmail: "new@example.com",
+      emailChangeCode: {
+        code: "123456",
+        expireAt: new Date(Date.now() + TEN_MINUTES),
+        reason: "email_change",
+      },
+      passwordResetCode: {
+        code: "222222",
+        expireAt: new Date(Date.now() + TEN_MINUTES),
+        reason: "password_reset",
+      },
+    });
+
+    await confirmEmailChange(user._id.toString(), "123456");
+
+    const stored = await readUser(user._id);
+    expect(stored.passwordResetCode.code).toBe("222222");
+    expect(stored.passwordResetCode.reason).toBe("password_reset");
   });
 
   it("cannot be replayed once the change has landed", async () => {
@@ -369,11 +444,11 @@ describe("confirmEmailChange", () => {
   });
 
   it("refuses a code minted for a different flow", async () => {
-    // All three OTP flows (account verification, password reset, email change)
-    // write to the same `verificationCode` sub-document, so `reason` is the
-    // only thing keeping them apart. Without this check a password-reset code
-    // — which the user can mint for themselves, unauthenticated, at any time —
-    // would also confirm an email change.
+    // Defence in depth, and why `reason` is kept on every slot even though the
+    // slot name now implies it (see models/User.ts). The structural barrier is
+    // the slot; this guard is what still fires if some future write puts a
+    // foreign code into the email-change slot. Without it that write would be
+    // silently authorised to move the account's login identifier.
     const { confirmEmailChange } = await userService();
     const user = await seedPendingChange({ reason: "password_reset" });
 
@@ -384,6 +459,32 @@ describe("confirmEmailChange", () => {
     expect(err.message).toBe(errMsg.INVALID_CONFIRMATION_REASON.en);
     const stored = await readUser(user._id);
     expect(stored.email).toBe("current@example.com");
+  });
+
+  it("cannot see a password-reset code at all", async () => {
+    // The structural half of the same property, and the stronger one. A
+    // password-reset code is the dangerous case because the user can mint it
+    // for themselves, unauthenticated, at any time — so if it landed anywhere
+    // this endpoint reads, "reset my password" would double as "move my login
+    // address". It now lives in a slot this endpoint never opens, so the code
+    // is not merely rejected, it is invisible.
+    const { confirmEmailChange } = await userService();
+    const user = await seedUser({
+      email: "current@example.com",
+      newEmail: "new@example.com",
+      passwordResetCode: {
+        code: "123456",
+        expireAt: new Date(Date.now() + TEN_MINUTES),
+        reason: "password_reset",
+      },
+    });
+
+    const err = await captureError(
+      confirmEmailChange(user._id.toString(), "123456"),
+    );
+
+    expect(err.message).toBe(errMsg.NO_EMAIL_CHANGE_REQUEST_FOUND.en);
+    expect((await readUser(user._id)).email).toBe("current@example.com");
   });
 
   it("rejects a confirmation with no pending request", async () => {
@@ -425,7 +526,7 @@ describe("confirmEmailChange", () => {
     const { requestEmailChange, confirmEmailChange } = await userService();
     const user = await seedUser({ email: "current@example.com" });
     await requestEmailChange(user._id.toString(), "contested@example.com");
-    const code = (await readUser(user._id)).verificationCode.code!;
+    const code = (await readUser(user._id)).emailChangeCode.code!;
 
     // The race: a second account takes the address while the code is in flight.
     await seedUser({ email: "contested@example.com" });
@@ -448,7 +549,7 @@ describe("confirmEmailChange", () => {
     const { requestEmailChange, confirmEmailChange } = await userService();
     const user = await seedUser({ email: "current@example.com" });
     await requestEmailChange(user._id.toString(), "free@example.com");
-    const code = (await readUser(user._id)).verificationCode.code!;
+    const code = (await readUser(user._id)).emailChangeCode.code!;
 
     const result = await confirmEmailChange(user._id.toString(), code);
 
@@ -481,17 +582,23 @@ describe("getUserById", () => {
 describe("getUserProfile", () => {
   it("withholds the password, refresh token, OTP and pending address", async () => {
     // This is the response the logged-in dashboard renders, so everything in
-    // it reaches the browser. A live `verificationCode` in particular would
-    // hand any XSS on the dashboard a working email-change confirmation.
+    // it reaches the browser. A live OTP in particular would hand any XSS on
+    // the dashboard a working email-change confirmation. All three slots are
+    // seeded, because a projection that names fields individually silently
+    // fails to strip any field added after it was written — which is exactly
+    // what splitting one slot into three could have caused.
     const { getUserProfile } = await userService();
+    const liveCode = {
+      code: "654321",
+      expireAt: new Date(Date.now() + TEN_MINUTES),
+      reason: "email_change",
+    };
     const user = await seedUser({
       refreshToken: "a-real-looking-refresh-token",
       newEmail: "pending@example.com",
-      verificationCode: {
-        code: "654321",
-        expireAt: new Date(Date.now() + TEN_MINUTES),
-        reason: "email_change",
-      },
+      verificationCode: liveCode,
+      passwordResetCode: liveCode,
+      emailChangeCode: liveCode,
     });
 
     const profile = (await getUserProfile(user._id.toString())).toObject();
@@ -500,6 +607,8 @@ describe("getUserProfile", () => {
     expect(profile.password).toBeUndefined();
     expect(profile.refreshToken).toBeUndefined();
     expect(profile.verificationCode).toBeUndefined();
+    expect(profile.passwordResetCode).toBeUndefined();
+    expect(profile.emailChangeCode).toBeUndefined();
     expect(profile.newEmail).toBeUndefined();
   });
 
@@ -690,15 +799,26 @@ describe("getAllUsers", () => {
     expect((await getAllUsers(1, 10, "axb")).users).toHaveLength(1);
   });
 
-  it("withholds passwords, refresh tokens and OTP codes from the admin list", async () => {
+  it("withholds passwords, refresh tokens, OTP codes and pending addresses from the admin list", async () => {
+    // `newEmail` is the assertion this test used to be missing, and it is not
+    // cosmetic: it is the unconfirmed address of an in-flight email change,
+    // which the person has not yet proved they control and may have typed by
+    // mistake. `getUserProfile` stripped it while this path and
+    // `getUserByIdAdmin` did not, so the codebase held two contradictory
+    // examples for anyone adding a fourth read path. All three now share one
+    // definition (HIDDEN_USER_FIELDS).
     const { getAllUsers } = await userService();
+    const liveCode = {
+      code: "654321",
+      expireAt: new Date(Date.now() + TEN_MINUTES),
+      reason: "password_reset",
+    };
     await seedUser({
       refreshToken: "a-real-looking-refresh-token",
-      verificationCode: {
-        code: "654321",
-        expireAt: new Date(Date.now() + TEN_MINUTES),
-        reason: "password_reset",
-      },
+      newEmail: "pending@example.com",
+      verificationCode: liveCode,
+      passwordResetCode: liveCode,
+      emailChangeCode: liveCode,
     });
 
     const { users } = await getAllUsers(1, 10);
@@ -707,19 +827,31 @@ describe("getAllUsers", () => {
     expect(row.password).toBeUndefined();
     expect(row.refreshToken).toBeUndefined();
     expect(row.verificationCode).toBeUndefined();
+    expect(row.passwordResetCode).toBeUndefined();
+    expect(row.emailChangeCode).toBeUndefined();
+    expect(row.newEmail).toBeUndefined();
+    // Control: the projection is an exclusion, so it must not have taken the
+    // ordinary fields with it. An admin list of blank rows would "pass" every
+    // assertion above.
+    expect(row.email).toBeDefined();
+    expect(row.firstName).toBeDefined();
   });
 });
 
 describe("getUserByIdAdmin", () => {
-  it("withholds the password, refresh token and OTP code", async () => {
+  it("withholds the password, refresh token, OTP codes and pending address", async () => {
     const { getUserByIdAdmin } = await userService();
+    const liveCode = {
+      code: "654321",
+      expireAt: new Date(Date.now() + TEN_MINUTES),
+      reason: "password_reset",
+    };
     const user = await seedUser({
       refreshToken: "a-real-looking-refresh-token",
-      verificationCode: {
-        code: "654321",
-        expireAt: new Date(Date.now() + TEN_MINUTES),
-        reason: "password_reset",
-      },
+      newEmail: "pending@example.com",
+      verificationCode: liveCode,
+      passwordResetCode: liveCode,
+      emailChangeCode: liveCode,
     });
 
     const found = (await getUserByIdAdmin(user._id.toString())).toObject();
@@ -728,6 +860,9 @@ describe("getUserByIdAdmin", () => {
     expect(found.password).toBeUndefined();
     expect(found.refreshToken).toBeUndefined();
     expect(found.verificationCode).toBeUndefined();
+    expect(found.passwordResetCode).toBeUndefined();
+    expect(found.emailChangeCode).toBeUndefined();
+    expect(found.newEmail).toBeUndefined();
   });
 
   it("rejects an unknown user", async () => {

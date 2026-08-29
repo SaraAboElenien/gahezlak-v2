@@ -68,6 +68,19 @@ async function seedCategory(
   });
 }
 
+async function seedItem(
+  categoryId: Types.ObjectId,
+  shopId: Types.ObjectId = SHOP_A,
+) {
+  return MenuItemModel.create({
+    shopId,
+    name: { en: "Burger", ar: "برجر" },
+    price: 100,
+    categoryId,
+    isAvailable: true,
+  });
+}
+
 beforeAll(async () => {
   await connectTestDB();
 });
@@ -279,37 +292,81 @@ describe("updateCategory", () => {
     expect(updated.name.en).toBe("Drinks");
   });
 
-  it("wipes the Arabic name when only the English one is submitted", async () => {
+  it.each([
+    [
+      "English",
+      { en: "Beverages" },
+      { en: "Beverages", ar: "أطباق رئيسية" } as const,
+    ],
+    ["Arabic", { ar: "مشروبات" }, { en: "Mains", ar: "مشروبات" } as const],
+  ])(
+    "renames the %s name without deleting the other language",
+    async (_lang, submitted, expected) => {
+      const { updateCategory } = await categoryService();
+      const category = await seedCategory();
+
+      const updated = await updateCategory(
+        SHOP_A.toString(),
+        category._id.toString(),
+        { name: submitted } as Parameters<typeof updateCategory>[2],
+      );
+
+      // REGRESSION. `updateCategoryValidator` marks `name.en` and `name.ar`
+      // each `.optional()`, so submitting one language alone is valid input —
+      // but `name` is a nested path, and Mongoose *replaces* a nested object
+      // in an update rather than merging it. Passing the pair through whole
+      // therefore deleted the other language, and because `findOneAndUpdate`
+      // runs no validators here the document was left violating its own
+      // `name.ar: { required: true }` schema with nothing reporting it. The
+      // Arabic public menu then rendered an empty heading over a whole
+      // section. The service now flattens the pair onto dotted paths so an
+      // update only touches the keys it was actually given.
+      expect(updated.name).toEqual(expected);
+
+      const stored = await CategoryModel.findById(category._id).lean();
+      expect(stored?.name).toEqual(expected);
+    },
+  );
+
+  it("merges a one-language description edit instead of dropping the other", async () => {
+    const { updateCategory } = await categoryService();
+    const category = await seedCategory({
+      description: { en: "Cold and hot", ar: "بارد وساخن" },
+    });
+
+    const updated = await updateCategory(
+      SHOP_A.toString(),
+      category._id.toString(),
+      { description: { ar: "بارد فقط" } } as Parameters<
+        typeof updateCategory
+      >[2],
+    );
+
+    // `description` is the same bilingual shape as `name` and was broken the
+    // same way; it is fixed by the same flattening rather than by a special
+    // case, so it is asserted here to stop a future narrowing of that loop.
+    expect(updated.description).toEqual({ en: "Cold and hot", ar: "بارد فقط" });
+  });
+
+  it("still replaces both languages when both are submitted", async () => {
     const { updateCategory } = await categoryService();
     const category = await seedCategory();
 
     const updated = await updateCategory(
       SHOP_A.toString(),
       category._id.toString(),
-      { name: { en: "Beverages" } } as Parameters<typeof updateCategory>[2],
+      { name: { en: "Beverages", ar: "مشروبات" } } as Parameters<
+        typeof updateCategory
+      >[2],
     );
 
-    // CURRENT BEHAVIOUR, not desired behaviour. `updateCategoryValidator`
-    // marks `name.en` and `name.ar` each `.optional()`, so submitting one
-    // language alone is valid input — but `name` is a nested path, and
-    // Mongoose *replaces* a nested object in an update rather than merging it
-    // into dotted paths. The Arabic heading is deleted, and because
-    // `findOneAndUpdate` does not run validators the document is left
-    // violating its own `name.ar: { required: true }` schema. The Arabic
-    // public menu then renders an empty heading for that section.
-    //
-    // Latent from the app today — `frontend/src/types/validations/menu/
-    // category.ts` requires both languages, so the real form never sends one
-    // — but the API contract permits it, which is the same shape as the
-    // "negative price" finding already recorded for menu items. Reported
-    // rather than fixed here because the right fix is a decision, not a
-    // rename: merge onto dotted paths, or make the validator require both
-    // languages whenever `name` is present. Do not "fix" this by changing
-    // these assertions.
-    expect(updated.name.ar).toBeUndefined();
+    // The other direction of the merge fix. Merging must not become "the old
+    // value wins": a deliberate rename of both languages has to overwrite
+    // both, or an owner correcting a typo would find the old text still there.
+    expect(updated.name).toEqual({ en: "Beverages", ar: "مشروبات" });
 
     const stored = await CategoryModel.findById(category._id).lean();
-    expect(stored?.name).toEqual({ en: "Beverages" });
+    expect(stored?.name).toEqual({ en: "Beverages", ar: "مشروبات" });
   });
 
   it("throws NotFound for a category id that does not exist", async () => {
@@ -355,32 +412,87 @@ describe("deleteCategory", () => {
     expect(await CategoryModel.countDocuments({ _id: foreign._id })).toBe(1);
   });
 
-  it("leaves the deleted category's menu items pointing at a category that no longer exists", async () => {
+  it("refuses to delete a category that still holds menu items, and destroys nothing", async () => {
     const { deleteCategory } = await categoryService();
     const category = await seedCategory();
-    const item = await MenuItemModel.create({
-      shopId: SHOP_A,
-      name: { en: "Burger", ar: "برجر" },
-      price: 100,
-      categoryId: category._id,
-      isAvailable: true,
-    });
+    const item = await seedItem(category._id);
 
-    await deleteCategory(SHOP_A.toString(), category._id.toString());
+    await expect(
+      deleteCategory(SHOP_A.toString(), category._id.toString()),
+    ).rejects.toThrow("This category still contains menu items");
 
-    // CURRENT BEHAVIOUR, not desired behaviour. The service runs
-    // `MenuItemModel.updateMany({ category: categoryId }, ...)` intending to
-    // orphan and hide the items, but the schema field is `categoryId` — the
-    // filter has always matched nothing, so the cleanup has never once run.
-    // Already logged in TECH_DEBT.md ("Deleting a menu item or a category
-    // leaves the other side dangling"); left alone here because the fix needs
-    // a product decision about what deletion *should* do to the items
-    // (orphan, reassign, or refuse while non-empty), not just a field rename.
-    // These assertions pin the status quo so that decision shows up as a
-    // failing test rather than a silent behaviour change.
-    const stored = await MenuItemModel.findById(item._id).lean();
-    expect(stored?.categoryId.toString()).toBe(category._id.toString());
-    expect(stored?.isAvailable).toBe(true);
+    // The service used to delete the category and then run
+    // `MenuItemModel.updateMany({ category: categoryId }, { category: null,
+    // isAvailable: false })` — a filter naming a path the schema does not have
+    // (`categoryId` is the real one), so it matched nothing on every call and
+    // the items were left pointing at a heading that no longer existed.
+    // Renaming the field would have made it destructive instead of dead:
+    // `categoryId` is `required: true`, so `null` is not a storable state, and
+    // hiding the dishes would have taken a whole section off the public menu
+    // with no way for the owner to find them again — the dashboard groups by
+    // category, and the category is gone. Refusing is the only outcome that
+    // can be undone by doing nothing.
+    //
+    // Both sides are asserted deliberately. A test that only checked the
+    // throw would still pass if the category had already been deleted before
+    // the count ran, which is exactly the ordering bug worth guarding against.
+    expect(await CategoryModel.countDocuments({ _id: category._id })).toBe(1);
+    const storedItem = await MenuItemModel.findById(item._id).lean();
+    expect(storedItem?.categoryId.toString()).toBe(category._id.toString());
+    expect(storedItem?.isAvailable).toBe(true);
+  });
+
+  it("deletes the category once its last item has been moved or removed", async () => {
+    const { deleteCategory } = await categoryService();
+    const category = await seedCategory();
+    const item = await seedItem(category._id);
+
+    await MenuItemModel.deleteOne({ _id: item._id });
+
+    // The other direction: the guard must clear as soon as the shop empties
+    // the category, or the refusal becomes a category that can never be
+    // deleted at all.
+    const deleted = await deleteCategory(
+      SHOP_A.toString(),
+      category._id.toString(),
+    );
+
+    expect(deleted._id.toString()).toBe(category._id.toString());
+    expect(await CategoryModel.countDocuments({})).toBe(0);
+  });
+
+  it("ignores another shop's items when deciding whether the category is empty", async () => {
+    const { deleteCategory } = await categoryService();
+    const category = await seedCategory({ shopId: SHOP_A });
+    // `updateMenuItem` allows an item's `categoryId` to be changed without
+    // checking the new category belongs to the same shop, so a foreign item
+    // pointing here is reachable today. Counting it would let any shop
+    // permanently block a competitor's category deletion with an error the
+    // victim cannot act on — they cannot see, move or delete that item.
+    await seedItem(category._id, SHOP_B);
+
+    const deleted = await deleteCategory(
+      SHOP_A.toString(),
+      category._id.toString(),
+    );
+
+    expect(deleted._id.toString()).toBe(category._id.toString());
+  });
+
+  it("reports another shop's non-empty category as not found, not as non-empty", async () => {
+    const { deleteCategory } = await categoryService();
+    const foreign = await seedCategory({ shopId: SHOP_B });
+    await seedItem(foreign._id, SHOP_B);
+
+    // Ownership has to be resolved before emptiness. "This category still
+    // contains menu items" would confirm to a competitor both that the id
+    // exists and that there is something on it — two facts they have no right
+    // to either.
+    await expect(
+      deleteCategory(SHOP_A.toString(), foreign._id.toString()),
+    ).rejects.toThrow("Category not found");
+
+    expect(await CategoryModel.countDocuments({ _id: foreign._id })).toBe(1);
   });
 });
 

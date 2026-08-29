@@ -1,7 +1,7 @@
 import { useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
-import { useSpecificPlanWithFallback } from "../../hooks/usePlans";
+import { useAdvertisedPlan } from "../../hooks/usePlans";
 import { useCreateSubscription } from "../../hooks/useSubscriptions";
 import { useProfile } from "../../hooks/useProfile";
 import { ArrowLeft, Check, AlertCircle } from "lucide-react";
@@ -15,7 +15,7 @@ export default function SubscriptionForm() {
     data: plan,
     isLoading: planLoading,
     error: planError,
-  } = useSpecificPlanWithFallback("688399b2e32b453c443937ff");
+  } = useAdvertisedPlan();
 
   // Use React Query mutation for subscription creation
   const createSubscriptionMutation = useCreateSubscription();

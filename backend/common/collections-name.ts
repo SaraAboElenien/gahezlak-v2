@@ -11,4 +11,5 @@ export const collectionsName = {
   REPORT: "report",
   AI_MENU_DATA: "ai_menu_data",
   RATE_LIMITS: "rate_limits",
+  PAYMENT_TRANSACTIONS: "payment_transactions",
 };

@@ -31,7 +31,17 @@ const REQUIRED_ENV_VARS = [
 // Deliberately a warning rather than a fatal error: local development without
 // SMTP credentials must still boot, matching how every other optional
 // integration in this codebase degrades (see the note above).
-const EMAIL_ENV_VARS = ["sendEmail", "emailPassword"] as const;
+// Each entry is one credential and the names it may arrive under, newest
+// first. The lowercase pair are the ORIGINAL names and are still read by
+// utils/send-email.ts for exactly one reason: they are what is currently set
+// in the live Render dashboard, and a hard rename would have broken production
+// email the moment it deployed. Checking only the new names here would print
+// "Email is not configured" at every boot while mail worked perfectly — a
+// false alarm in the one place an operator is meant to trust.
+const EMAIL_ENV_VARS = [
+  { credential: "SMTP_USER", names: ["SMTP_USER", "sendEmail"] },
+  { credential: "SMTP_PASSWORD", names: ["SMTP_PASSWORD", "emailPassword"] },
+] as const;
 
 // Same reasoning as EMAIL_ENV_VARS, for the other integration whose absence
 // stays invisible until a customer is already out of pocket.
@@ -62,7 +72,9 @@ export function validateEnv(): void {
     );
   }
 
-  const missingEmail = EMAIL_ENV_VARS.filter((name) => !process.env[name]);
+  const missingEmail = EMAIL_ENV_VARS.filter((v) =>
+    v.names.every((name) => !process.env[name]),
+  ).map((v) => v.credential);
 
   if (missingEmail.length > 0) {
     // console.warn rather than the pino logger: this module runs before

@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "build": "tsc",
     "start": "node --env-file-if-exists=.env dist/server.js",
     "seed:plans:dev": "set NODE_ENV=development&& tsx --env-file=.env utils/seed-plans.ts",

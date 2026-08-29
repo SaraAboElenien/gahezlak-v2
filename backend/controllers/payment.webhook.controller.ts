@@ -13,6 +13,11 @@ import {
 } from "../utils/paymob-hmac-verification";
 import { Orders, OrderStatus } from "../models/Order";
 import { PaymentMethods } from "../models/Payment";
+import { PaymentTransactionKind } from "../models/PaymentTransaction";
+import {
+  recordSettledTransaction,
+  toRefId,
+} from "../services/payment-ledger.service";
 
 /**
  * The `obj` payload Paymob sends on a `type: "TRANSACTION"` webhook. Only the
@@ -177,6 +182,36 @@ async function handleTransactionProcessed(data: PaymobTransactionObject) {
   logger.info(
     `Subscription for shop ${shopId} ACTIVATED via Transaction ID ${data.id}.`,
   );
+
+  // A TRIAL SIGNUP TAKES NO MONEY, so it must not appear in the ledger.
+  //
+  // Paymob's guidance (2026-08-05) is that a plan with a trial runs its first
+  // transaction through a *verification* integration, which authorises and
+  // then auto-voids. The authorisation is real enough to produce a webhook,
+  // which is exactly why this is worth stating: recording it would book
+  // revenue for every free trial the platform ever grants, and the figure
+  // would look plausible. The charge that does count arrives later, as a
+  // renewal, when the trial converts.
+  //
+  // This project has already shipped the inverse of this bug once — trial
+  // signups were charged the full price on day one because the card
+  // integration was used instead of the verification one.
+  if (plan.trialPeriodDays > 0) {
+    logger.info(
+      `Ledger: skipping shop ${shopId}'s initial transaction — trial signup, authorised and voided rather than captured.`,
+    );
+    return;
+  }
+
+  await recordSettledTransaction({
+    kind: PaymentTransactionKind.SUBSCRIPTION_INITIAL,
+    shopId: toRefId(subscription.shop)!,
+    subscriptionId: subscription._id,
+    planId: plan._id,
+    amount: plan.price,
+    paymobTransactionId: data.id,
+    settledAt: subscription.currentPeriodStart,
+  });
 }
 
 async function handleSubscriptionCreated(payload: PaymobSubscriptionWebhook) {
@@ -351,6 +386,21 @@ async function handleSubscriptionRenewed(data: PaymobSubscriptionWebhook) {
       subscription.shop
     } renewed successfully. New period: ${newPeriodStart.toISOString()} to ${newPeriodEnd.toISOString()}.`,
   );
+
+  // A renewal is money Paymob actually took against the stored mandate, so it
+  // is platform revenue. `newPeriodStart` is used as the settlement date
+  // rather than `new Date()`: it is derived from Paymob's own timestamp, so a
+  // webhook that arrives late — or is redelivered days afterwards — still
+  // books the charge in the period it belongs to.
+  await recordSettledTransaction({
+    kind: PaymentTransactionKind.SUBSCRIPTION_RENEWAL,
+    shopId: toRefId(subscription.shop)!,
+    subscriptionId: subscription._id,
+    planId: toRefId(subscription.plan),
+    amount: plan.price,
+    paymobTransactionId: transaction_id,
+    settledAt: newPeriodStart,
+  });
 }
 
 export const handlePaymobOrdersWebhook: RequestHandler = async (req, res) => {
@@ -431,6 +481,27 @@ async function handleOrderPaid(
     logger.warn(
       `Order ${orderId} is stored as paymentMethod "${order.paymentMethod}" but Paymob reported source_data.type "${sourceType}". Leaving the stored value untouched — investigate before trusting this order's payment method.`,
     );
+  }
+
+  // Recorded, but NOT counted as platform revenue — this money is the
+  // restaurant's (see PLATFORM_REVENUE_KINDS). It is worth a ledger row
+  // anyway, because it is the only durable evidence that a specific order was
+  // genuinely settled: `Order.orderStatus` can be moved by hand from the
+  // dashboard, and production already contains an order sitting at `Confirmed`
+  // that was never paid for at the time it was set.
+  //
+  // `findByIdAndUpdate` was called with `{ new: false }`, so `order` is the
+  // pre-update document — which is what we want, since the amount is not
+  // touched by the update.
+  if (order) {
+    await recordSettledTransaction({
+      kind: PaymentTransactionKind.ORDER,
+      shopId: toRefId(order.shopId)!,
+      orderId: order._id,
+      amount: order.totalAmount,
+      paymobTransactionId: Number(transactionId),
+      settledAt: new Date(),
+    });
   }
 
   return order;

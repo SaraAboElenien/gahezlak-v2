@@ -6,7 +6,19 @@ export type CurrentUserPayload = JwtPayload & {
   userId: string;
   email: string;
   role: string;
-  shopId: string;
+  /**
+   * Optional, because the token frequently carries no shop.
+   *
+   * `generateTokens` signs `shopId: user.shop?._id.toString()`, which is
+   * `undefined` for every user between signup and shop creation and for every
+   * platform admin. Declaring it `string` was the lie behind the 21
+   * `req.user?.shopId!` assertions removed in the 2026-08-01 lint pass — the
+   * assertions were papering over a type that promised something the runtime
+   * value did not deliver. Handlers that genuinely need a shop must now say so
+   * (`requireShopId`) and fail with an honest 400 rather than passing
+   * `undefined` into a query that quietly matches the wrong thing.
+   */
+  shopId?: string;
 };
 
 interface PaymobClientInfo {

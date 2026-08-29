@@ -38,16 +38,24 @@ type VerifyCodeResult = Omit<
 >;
 type RefreshResult = { accessToken: string };
 
+type SignUpResult = Awaited<ReturnType<typeof signUp>>;
+
 export const signUpHandler: RequestHandler<
   NoParams,
-  SuccessResponse<EmptyData>,
+  SuccessResponse<SignUpResult>,
   SignUpBody
 > = async (req, res) => {
-  await signUp(req.body);
+  const result = await signUp(req.body);
+  // The message still assumes success; `data.verificationEmailSent` is what
+  // lets a client say otherwise. Telling someone to check an inbox that will
+  // never receive anything removes their reason to act — they wait, check
+  // spam, and conclude the product is broken, while the unverified row blocks
+  // them from re-registering the same address. See the note in signUp for why
+  // branching on delivery is safe on THIS endpoint and on no other.
   res.status(201).json({
     message:
       "Registration successful! Please check your email for the verification code.",
-    data: {},
+    data: result,
   });
 };
 

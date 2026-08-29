@@ -4,6 +4,7 @@ import { isAllowed, protect } from "../middlewares/auth";
 import {
   createRoleValidator,
   updateRoleValidator,
+  roleIdParamValidator,
 } from "../validators/role.validator";
 import { Role } from "../models/Role";
 
@@ -26,12 +27,14 @@ roleRoutes.get(
   "/:id",
   protect,
   isAllowed([Role.ADMIN]),
+  roleIdParamValidator,
   controllers.getRoleByIdHandler,
 );
 roleRoutes.put(
   "/:id",
   protect,
   isAllowed([Role.ADMIN]),
+  roleIdParamValidator,
   updateRoleValidator,
   controllers.updateRoleHandler,
 );
@@ -39,6 +42,7 @@ roleRoutes.delete(
   "/:id",
   protect,
   isAllowed([Role.ADMIN]),
+  roleIdParamValidator,
   controllers.deleteRoleHandler,
 );
 

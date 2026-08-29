@@ -211,9 +211,17 @@ export async function getAllSubscriptions(filters: {
         as: "plan",
       },
     },
-    { $unwind: "$user" },
-    { $unwind: "$shop" },
-    { $unwind: "$plan" },
+    // `preserveNullAndEmptyArrays` is what makes these left joins rather than
+    // inner ones. Without it a subscription whose user, shop or plan no longer
+    // resolves is dropped from the pipeline entirely — and, because the count
+    // pipeline reuses these same stages, from `totalCount` alongside it. The
+    // list stayed self-consistent and simply under-reported: a revenue list
+    // that silently omits rows is worse than one showing a row with a missing
+    // name, because nothing about it looks wrong. A deleted shop or a deleted
+    // plan is enough to trigger it, and the subscription remains billable.
+    { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
+    { $unwind: { path: "$shop", preserveNullAndEmptyArrays: true } },
+    { $unwind: { path: "$plan", preserveNullAndEmptyArrays: true } },
   ];
   if (search) {
     // Escaped — see utils/escape-regex.ts. This one runs inside an aggregation
@@ -255,7 +263,16 @@ export async function getAllSubscriptions(filters: {
 export async function getSubscriptionById(
   subscriptionId: string,
 ): Promise<ISubscription | null> {
-  const subscription = await Subscriptions.findById(subscriptionId)
+  // Cast before the query, for the same reason the two `$match` filters above
+  // do. `findById` on a malformed id throws a Mongoose CastError, which is not
+  // a `CustomError` — so the handler's "null means 404" path is never reached
+  // and the global handler falls through to a 500 plus a Sentry event. A
+  // mistyped id in the admin panel reported a server fault rather than a bad
+  // request. The route now validates the param too; this keeps any other
+  // caller honest.
+  const subscription = await Subscriptions.findById(
+    toObjectId(subscriptionId, "subscriptionId"),
+  )
     .populate("userId", "firstName lastName email phoneNumber")
     .populate("shop", "name email phoneNumber address")
     .populate(

@@ -1,10 +1,40 @@
-import mongoose, { FilterQuery } from "mongoose";
+import mongoose, { FilterQuery, PipelineStage } from "mongoose";
 import { IOrder, Orders, OrderStatus } from "../models/Order";
 import { Errors } from "../errors";
 import {
+  PLATFORM_TIMEZONE,
   parsePlatformDateWindow,
   platformDayWindowFromDates,
 } from "../utils/report-date-window";
+
+/**
+ * What counts as a sale, in one place.
+ *
+ * `totalRevenue` and `SalesComparison` are rendered side by side on the
+ * owner's analytics tab and are computed over the same collection, but they
+ * used to disagree: the revenue figure excluded `Cancelled` and `Pending`
+ * while the trend chart applied no status filter at all, so the chart was
+ * inflated by every order the kitchen refused and every order nobody has paid
+ * for yet. Two numbers derived from one collection that do not reconcile is
+ * worse than either being wrong alone, because it leaves the owner no way to
+ * tell which to believe.
+ *
+ * `totalRevenue`'s definition is the one kept. `Cancelled` is uncontroversial;
+ * `Pending` is excluded because it is money that exists but has not settled —
+ * a customer who abandoned the Paymob iframe leaves a Pending order behind
+ * forever (see `handleOrderPaid`, which is what promotes one to `Confirmed`).
+ *
+ * Exported as a function rather than a shared object literal so no caller can
+ * mutate the filter another caller is about to spread.
+ */
+const NON_SALE_ORDER_STATUSES = [
+  OrderStatus.Cancelled,
+  OrderStatus.Pending,
+] as const;
+
+function saleOrderStatusFilter(): FilterQuery<IOrder> {
+  return { orderStatus: { $nin: [...NON_SALE_ORDER_STATUSES] } };
+}
 
 export async function CanceledOrderRate(shopId: string) {
   const totalOrders = await Orders.countDocuments({ shopId });
@@ -26,14 +56,26 @@ export async function OrderCountsByDate(
   shopId: string,
   period: "daily" | "monthly" | "yearly",
 ) {
+  // Every date operator here is given PLATFORM_TIMEZONE explicitly. Left off,
+  // MongoDB buckets in UTC — and Cairo is UTC+2/+3, so every order taken
+  // between local midnight and 02:00/03:00 was filed under the previous day.
+  // For a restaurant that is not a rare edge, it is the tail of the dinner
+  // service, and it also made "today" on this chart disagree with "today" in
+  // the orders list for the first hours of every local morning. Same
+  // platform-wide-zone decision as the report windows below; see
+  // utils/report-date-window.ts.
+  const tz = { timezone: PLATFORM_TIMEZONE };
   const groupId = {
     daily: {
-      year: { $year: "$createdAt" },
-      month: { $month: "$createdAt" },
-      day: { $dayOfMonth: "$createdAt" },
+      year: { $year: { date: "$createdAt", ...tz } },
+      month: { $month: { date: "$createdAt", ...tz } },
+      day: { $dayOfMonth: { date: "$createdAt", ...tz } },
     },
-    monthly: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } },
-    yearly: { year: { $year: "$createdAt" } },
+    monthly: {
+      year: { $year: { date: "$createdAt", ...tz } },
+      month: { $month: { date: "$createdAt", ...tz } },
+    },
+    yearly: { year: { $year: { date: "$createdAt", ...tz } } },
   }[period];
 
   const ordersPerDate = await Orders.aggregate([
@@ -67,6 +109,9 @@ export async function SalesComparison(
         $match: {
           shopId: new mongoose.Types.ObjectId(shopId),
           createdAt: { $gte: window.start, $lt: window.end },
+          // Same definition of "a sale" as totalRevenue — see
+          // saleOrderStatusFilter above.
+          ...saleOrderStatusFilter(),
         },
       },
       { $group: { _id: null, total: { $sum: "$totalAmount" } } },
@@ -113,8 +158,14 @@ export async function BestAndWorstSellers(
     }
   }
 
-  // Helper function to create aggregation pipeline
-  const createAggregationPipeline = (sortOrder: 1 | -1) => [
+  // Helper function to create aggregation pipeline.
+  //
+  // The secondary sort on `menuItemId` is deliberately reversed between the two
+  // orders, so the two pipelines are exact mirrors of each other rather than
+  // both falling back to whatever order Mongo happens to return for a tie. Two
+  // dishes that sold the same amount would otherwise be free to appear at the
+  // head of *both* lists.
+  const createAggregationPipeline = (sortOrder: 1 | -1): PipelineStage[] => [
     { $match: matchQuery },
     { $unwind: "$orderItems" },
     {
@@ -131,16 +182,24 @@ export async function BestAndWorstSellers(
         as: "menuItem",
       },
     },
-    { $unwind: "$menuItem" },
+    // `preserveNullAndEmptyArrays` matters: without it this $unwind is an inner
+    // join, so a dish that sold well and was later deleted from the menu
+    // vanished from the ranking entirely — the report silently under-reported
+    // exactly the history a report about the past exists to show. The row is
+    // now kept and labelled instead, and `menuItemId` is taken from the group
+    // key (which is always present) rather than from the joined document.
+    { $unwind: { path: "$menuItem", preserveNullAndEmptyArrays: true } },
     {
       $project: {
         _id: 0,
-        menuItemId: "$menuItem._id",
-        name: "$menuItem.name",
+        menuItemId: "$_id",
+        name: {
+          $ifNull: ["$menuItem.name", { en: "Deleted item", ar: "صنف محذوف" }],
+        },
         total: 1,
       },
     },
-    { $sort: { total: sortOrder } },
+    { $sort: { total: sortOrder, menuItemId: sortOrder === -1 ? 1 : -1 } },
     { $limit: limit },
   ];
 
@@ -151,9 +210,23 @@ export async function BestAndWorstSellers(
       Orders.aggregate(createAggregationPipeline(1)), // Worst sellers (ascending)
     ]);
 
+    // The two lists are one ranking read from both ends, so a shop with fewer
+    // distinct sold dishes than `limit` used to see its single best seller
+    // presented as a worst seller too — on a new shop's dashboard, which is
+    // precisely the first time anyone looks at the feature.
+    //
+    // "Best" wins the tie-break: anything already shown as a best seller is
+    // dropped from the worst list, which suppresses the worst panel entirely
+    // until there are enough dishes for the comparison to say anything. Note
+    // this changes nothing at all once a shop has at least `2 * limit` distinct
+    // sold dishes — the ample case, where the two ends cannot meet.
+    const bestIds = new Set(bestSellers.map((row) => String(row.menuItemId)));
+
     return {
       bestSellers: bestSellers || [],
-      worstSellers: worstSellers || [],
+      worstSellers: (worstSellers || []).filter(
+        (row) => !bestIds.has(String(row.menuItemId)),
+      ),
     };
   } catch {
     throw new Errors.UnprocessableError({
@@ -168,7 +241,7 @@ export async function totalRevenue(shopId: string) {
     {
       $match: {
         shopId: new mongoose.Types.ObjectId(shopId),
-        orderStatus: { $nin: [OrderStatus.Cancelled, OrderStatus.Pending] },
+        ...saleOrderStatusFilter(),
       },
     },
     { $group: { _id: null, total: { $sum: "$totalAmount" } } },

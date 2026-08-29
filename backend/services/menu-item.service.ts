@@ -1,5 +1,4 @@
 import { Shops } from "../models/Shop";
-import { CategoryModel } from "../models/Category";
 import { MenuItemModel, IMenuItem } from "../models/MenuItem";
 import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
@@ -49,11 +48,13 @@ export const deleteMenuItem = async (shopId: string, itemId: string) => {
   }).lean();
   if (!menuItem) throw new Errors.NotFoundError(errMsg.MENU_ITEM_NOT_FOUND);
 
-  await CategoryModel.updateMany(
-    { shopId, menuItems: itemId },
-    { $pull: { menuItems: itemId } },
-  );
-
+  // No back-reference to clean up. A category owns nothing: the relationship is
+  // held entirely by `MenuItem.categoryId`, so deleting the item deletes the
+  // link. This used to `$pull` the item out of a `Category.menuItems` array
+  // that `models/Category.ts` has never declared — the filter matched no
+  // document on any call, which is why nothing ever looked wrong. Removed
+  // rather than "fixed", because inventing that array would give the
+  // membership two sources of truth that could disagree.
   return menuItem;
 };
 

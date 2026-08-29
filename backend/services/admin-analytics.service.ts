@@ -1,6 +1,9 @@
-import { FilterQuery, PipelineStage } from "mongoose";
-import { ISubscription, Subscriptions } from "../models/Subscription";
+import { PipelineStage } from "mongoose";
 import { Orders } from "../models/Order";
+import {
+  PaymentTransactions,
+  PLATFORM_REVENUE_KINDS,
+} from "../models/PaymentTransaction";
 import { parsePlatformDateWindow } from "../utils/report-date-window";
 
 /**
@@ -25,36 +28,58 @@ import { parsePlatformDateWindow } from "../utils/report-date-window";
  */
 const parseDateWindow = parsePlatformDateWindow;
 
-// Total Revenue from Subscriptions
+/**
+ * Total platform revenue: the sum of subscription charges that SETTLED inside
+ * the window.
+ *
+ * REWRITTEN 2026-08-29 (ADR-018). This used to sum `plan.price` over every
+ * subscription whose billing period was *contained* by the window, which was
+ * wrong three separate ways and confidently so — it reported a number rather
+ * than failing:
+ *
+ *   1. Containment, not overlap, so every still-running subscription was
+ *      excluded. A monthly plan could only ever be counted in a window at
+ *      least a month wide that happened to bracket it exactly.
+ *   2. It read the plan's price *now*. Editing a plan silently rewrote every
+ *      historical figure that plan had ever contributed to.
+ *   3. It counted subscriptions, not payments — so a trial that never
+ *      converted, or a renewal Paymob failed to take, still scored full price.
+ *
+ * All three dissolve once there is a record of money to aggregate over, which
+ * is what `PaymentTransactions` is. Note the window is now applied to
+ * `settledAt`, a fact about a transaction that never changes, rather than to
+ * subscription period boundaries, which move.
+ *
+ * ORDER PAYMENTS ARE EXCLUDED — see `PLATFORM_REVENUE_KINDS`. That money
+ * belongs to the restaurant; counting it here would overstate the platform by
+ * roughly the entire GMV.
+ */
 export async function getTotalPlatformRevenue(
   startDate: string,
   endDate: string,
 ) {
-  const query: FilterQuery<ISubscription> = { status: "active" };
+  const match: PipelineStage.Match["$match"] = {
+    kind: { $in: [...PLATFORM_REVENUE_KINDS] },
+  };
 
   const dateWindow = parseDateWindow(startDate, endDate);
   if (dateWindow) {
-    // Containment semantics (start within window AND end within window) are
-    // a separate, already-known bug (see TECH_DEBT.md / the service test
-    // file) and are deliberately left exactly as-is here — only how the
-    // window's own boundaries are computed has changed. `end` is now the
-    // exclusive next-local-midnight instant from `parsePlatformDateWindow`,
-    // so the comparison is `$lt` rather than the old inclusive `$lte`.
-    query.currentPeriodStart = { $gte: dateWindow.start };
-    query.currentPeriodEnd = { $lt: dateWindow.end };
+    // Half-open [start, end): `end` is the exclusive next-local-midnight
+    // instant from `parsePlatformDateWindow`, which is why this is `$lt` and
+    // not `$lte`. An inclusive end is how this project previously dropped the
+    // whole final day of every report.
+    match.settledAt = { $gte: dateWindow.start, $lt: dateWindow.end };
   }
 
-  const subscriptions = await Subscriptions.find(query).populate("plan");
+  const [result] = await PaymentTransactions.aggregate<{ total: number }>([
+    { $match: match },
+    { $group: { _id: null, total: { $sum: "$amount" } } },
+  ]);
 
-  const totalRevenue = subscriptions.reduce((sum, sub) => {
-    // `plan` is an ObjectId unless populate() resolved it — narrow rather
-    // than assert, so an unpopulated doc scores 0 instead of NaN.
-    const plan = sub.plan;
-    const planPrice = plan && "price" in plan ? plan.price : 0;
-    return sum + planPrice;
-  }, 0);
-
-  return totalRevenue;
+  // No matching transactions is a legitimate answer of zero, not an error —
+  // and it is the honest answer today, since no subscription charge has ever
+  // settled on this platform.
+  return result?.total ?? 0;
 }
 
 // Revenue Growth Rate
@@ -104,12 +129,19 @@ export async function getTopPerformingRestaurants(
         as: "shop",
       },
     },
-    { $unwind: "$shop" },
+    // `preserveNullAndEmptyArrays` is load-bearing. `$unwind` over an empty
+    // array DROPS the document, so without it this stage is silently an inner
+    // join: a shop that has since been deleted takes its revenue out of the
+    // ranking entirely, and the admin sees a total that does not reconcile
+    // with the orders actually in the database. Failing to name a deleted shop
+    // is acceptable; failing to count its money is not.
+    { $unwind: { path: "$shop", preserveNullAndEmptyArrays: true } },
     {
       $project: {
         _id: 0,
         shopId: "$_id",
-        shopName: "$shop.name",
+        // A deleted shop still has revenue and still needs a label.
+        shopName: { $ifNull: ["$shop.name", null] },
         totalShopRevenue: 1,
       },
     },

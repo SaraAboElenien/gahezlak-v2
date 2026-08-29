@@ -35,6 +35,16 @@ export const createSubscriptionHandler: RequestHandler<
 
   const plan = await planService.getPlanById(planId);
 
+  // The server-side half of "deactivate a plan". `getPlanById` deliberately
+  // still returns retired plans — an admin has to be able to fetch one to put
+  // it back on sale — so this is the only place that refuses to *sell* one.
+  // Without it, taking a plan off sale hid it from the pricing page and left
+  // every previously-issued link to it fully working, at a price we no longer
+  // offer.
+  if (!plan.isActive) {
+    throw new Errors.BadRequestError(errMsg.PLAN_INACTIVE);
+  }
+
   const { effectiveTrialDays } =
     await subscriptionService.createOrUpdatePendingSubscription({
       shopId: user.shop.toString(),

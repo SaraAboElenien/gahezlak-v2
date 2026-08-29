@@ -181,13 +181,21 @@ services:
         sync: false
 
       # --- Email (OTP verification + password reset) ---------------------
-      # These two are the only non-ALL_CAPS vars in the project:
-      # utils/send-email.ts reads process.env.sendEmail / process.env.
-      # emailPassword verbatim. Render env var keys are case-sensitive —
-      # type them exactly as written or email silently breaks.
-      - key: sendEmail
+      # RENAMED from sendEmail / emailPassword, which were the last two
+      # non-ALL_CAPS vars in the project.
+      #
+      # ACTION REQUIRED IN THE RENDER DASHBOARD. Render env var keys are
+      # case-sensitive, and this blueprint does not rename an existing key —
+      # adding SMTP_USER here leaves the old sendEmail entry in place with its
+      # value. utils/send-email.ts still reads the old names as a fallback so
+      # that deploying this change cannot break outbound mail on its own, but
+      # the fallback is temporary: add SMTP_USER / SMTP_PASSWORD with the same
+      # values, confirm mail still sends, then delete sendEmail /
+      # emailPassword. Until then the service logs a deprecation warning on
+      # its first send.
+      - key: SMTP_USER
         sync: false
-      - key: emailPassword
+      - key: SMTP_PASSWORD
         sync: false
 
       # Optional. Unset = Gmail, exactly as before. Set SMTP_HOST to use a
@@ -197,7 +205,7 @@ services:
       # ignore it, so signup "succeeds" and no email arrives).
       #
       # Brevo:  SMTP_HOST=smtp-relay.brevo.com, SMTP_PORT=587,
-      #         sendEmail=<Brevo login>, emailPassword=<Brevo SMTP key>,
+      #         SMTP_USER=<Brevo login>, SMTP_PASSWORD=<Brevo SMTP key>,
       #         EMAIL_FROM=<a sender verified in Brevo>.
       #
       # EMAIL_FROM is needed whenever the SMTP login is not itself a usable

@@ -7,7 +7,7 @@ import {
 } from "../services/report.service";
 import { SuccessResponse } from "../common/types/controller-response.types";
 import { IReport } from "../models/Report";
-import { requireUser } from "../utils/current-user";
+import { requireShopId } from "../utils/current-user";
 
 export const createShopReportController: RequestHandler<
   //RequestHandler<params, res, body>
@@ -68,7 +68,7 @@ export const getAllAdminReportsController: RequestHandler = async (
 };
 
 export const getAllShopReportsController: RequestHandler = async (req, res) => {
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const reports = await getAllShopReports(shopId);
 
   res.status(200).json({

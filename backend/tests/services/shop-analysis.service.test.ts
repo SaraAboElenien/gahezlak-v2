@@ -264,21 +264,53 @@ describe("OrderCountsByDate", () => {
   });
 
   /**
-   * CHARACTERISATION (see the report). `$year`/`$month`/`$dayOfMonth` bucket in
-   * **UTC** unless given a `timezone`. Every shop on this platform is in Cairo
-   * (UTC+2/+3), so the dinner rush that runs past midnight local time is filed
-   * under the previous day, and a "daily orders" chart is shifted for every
-   * order placed between midnight and 02:00/03:00 local.
+   * REGRESSION. `$year`/`$month`/`$dayOfMonth` bucket in **UTC** unless given a
+   * `timezone`. Every shop on this platform is in Cairo (UTC+2/+3), so without
+   * it the dinner rush that runs past local midnight was filed under the
+   * previous day — not a rare edge for a restaurant, and it also made "today"
+   * on this chart disagree with "today" in the orders list for the first hours
+   * of every local morning.
+   *
+   * The instant is derived from the real IANA offset rather than a hardcoded
+   * "+2"/"+3" (Egypt observes DST roughly May-October), using the same
+   * primitive the report windows use — so this pins the *contract*, not
+   * today's specific offset.
    */
-  it("CHARACTERISATION: buckets in UTC, so a post-midnight Cairo order lands on the previous day", async () => {
-    // 2026-03-02T00:30 in Cairo (UTC+2) is 2026-03-01T22:30Z.
-    await seedOrder({ createdAt: new Date("2026-03-01T22:30:00.000Z") });
+  it("buckets by Cairo calendar day, so a post-midnight local order lands on the local day", async () => {
+    // 30 minutes past Cairo midnight opening 2026-03-02, expressed in UTC.
+    const cairoMidnightUtcMs =
+      Date.UTC(2026, 2, 2) -
+      getPlatformTimeZoneOffsetMs(new Date("2026-03-02T00:00:00.000Z"));
+    await seedOrder({ createdAt: new Date(cairoMidnightUtcMs + 30 * 60_000) });
 
     const counts = await OrderCountsByDate(SHOP_A.toString(), "daily");
 
     expect(counts).toEqual([
-      { _id: { year: 2026, month: 3, day: 1 }, count: 1 },
+      { _id: { year: 2026, month: 3, day: 2 }, count: 1 },
     ]);
+  });
+
+  /**
+   * The same shift applies at a month and a year boundary, where it silently
+   * moves trade into the wrong reporting period rather than merely the wrong
+   * day. Both grouping modes take the timezone too; nothing here would fail if
+   * only the `daily` branch had been fixed, so they are asserted separately.
+   */
+  it("buckets by Cairo calendar month and year at a New Year boundary", async () => {
+    // 30 minutes past Cairo midnight opening 2026-01-01 — 2025-12-31 in UTC.
+    const cairoNewYearUtcMs =
+      Date.UTC(2026, 0, 1) -
+      getPlatformTimeZoneOffsetMs(new Date("2026-01-01T00:00:00.000Z"));
+    const justAfterMidnight = new Date(cairoNewYearUtcMs + 30 * 60_000);
+
+    await seedOrder({ createdAt: justAfterMidnight });
+
+    await expect(
+      OrderCountsByDate(SHOP_A.toString(), "monthly"),
+    ).resolves.toEqual([{ _id: { year: 2026, month: 1 }, count: 1 }]);
+    await expect(
+      OrderCountsByDate(SHOP_A.toString(), "yearly"),
+    ).resolves.toEqual([{ _id: { year: 2026 }, count: 1 }]);
   });
 });
 
@@ -413,13 +445,17 @@ describe("SalesComparison", () => {
   });
 
   /**
-   * CHARACTERISATION (see the report). `SalesComparison` applies **no status
-   * filter**, so a cancelled order counts as a sale — while `totalRevenue()`
-   * in this same file deliberately excludes Cancelled and Pending. The two
-   * numbers on one dashboard therefore disagree about the same month, and the
-   * comparison chart is inflated by every order the kitchen refused.
+   * REGRESSION for the two-numbers-one-dashboard bug. `SalesComparison` used
+   * to apply **no status filter**, while `totalRevenue()` in this same file
+   * deliberately excludes Cancelled and Pending — so the trend chart was
+   * inflated by every order the kitchen refused and every order nobody has
+   * paid for, and it could not be reconciled with the revenue figure printed
+   * beside it.
+   *
+   * The assertion that matters is the *agreement*, not either number alone:
+   * both are computed here over one set of orders and required to match.
    */
-  it("CHARACTERISATION: counts cancelled and pending orders as sales, unlike totalRevenue()", async () => {
+  it("agrees with totalRevenue() about what counts as a sale", async () => {
     await seedOrder({
       totalAmount: 100,
       orderStatus: OrderStatus.Delivered,
@@ -442,24 +478,81 @@ describe("SalesComparison", () => {
       ...august,
     );
 
-    expect(comparison.total1).toBe(200);
-    // The very same orders, through the other revenue function on this page:
-    await expect(totalRevenue(SHOP_A.toString())).resolves.toBe(100);
+    expect(comparison.total1).toBe(100);
+    // The very same orders, through the other revenue function on this page.
+    await expect(totalRevenue(SHOP_A.toString())).resolves.toBe(
+      comparison.total1,
+    );
+  });
+
+  /**
+   * The other direction: every status that IS a sale still counts, so the
+   * shared filter cannot be tightened into hiding real trade. Confirmed and
+   * Preparing matter most — an order the kitchen is actively cooking is paid
+   * for and is revenue, and dropping it would make the chart under-report at
+   * exactly the busiest moment of the day.
+   */
+  it("counts every non-cancelled, non-pending status as a sale", async () => {
+    for (const orderStatus of [
+      OrderStatus.Confirmed,
+      OrderStatus.Preparing,
+      OrderStatus.Ready,
+      OrderStatus.Delivered,
+    ]) {
+      await seedOrder({
+        totalAmount: 25,
+        orderStatus,
+        createdAt: new Date("2026-07-10"),
+      });
+    }
+
+    await expect(
+      SalesComparison(SHOP_A.toString(), ...july, ...august),
+    ).resolves.toMatchObject({ total1: 100 });
   });
 });
 
 describe("BestAndWorstSellers", () => {
+  /**
+   * The ample case — enough distinct dishes that the two ends of the ranking
+   * cannot meet — where the disjointness rule below changes nothing at all.
+   */
   it("ranks menu items by quantity sold, best descending and worst ascending", async () => {
+    const sold: Record<string, number> = {
+      Burger: 12,
+      Pizza: 9,
+      Wrap: 7,
+      Soup: 4,
+      Fries: 3,
+      Salad: 1,
+    };
+    for (const [name, quantity] of Object.entries(sold)) {
+      const item = await seedMenuItem(name);
+      await seedOrder({ items: [{ menuItem: item.id, quantity }] });
+    }
+
+    const { bestSellers, worstSellers } = await BestAndWorstSellers(
+      SHOP_A.toString(),
+      3,
+    );
+
+    expect(bestSellers.map((row) => [row.name.en, row.total])).toEqual([
+      ["Burger", 12],
+      ["Pizza", 9],
+      ["Wrap", 7],
+    ]);
+    expect(worstSellers.map((row) => [row.name.en, row.total])).toEqual([
+      ["Salad", 1],
+      ["Fries", 3],
+      ["Soup", 4],
+    ]);
+  });
+
+  it("sums a dish's quantity across separate orders", async () => {
     const burger = await seedMenuItem("Burger");
     const salad = await seedMenuItem("Salad");
-    const pizza = await seedMenuItem("Pizza");
 
-    await seedOrder({
-      items: [
-        { menuItem: burger.id, quantity: 10 },
-        { menuItem: pizza.id, quantity: 5 },
-      ],
-    });
+    await seedOrder({ items: [{ menuItem: burger.id, quantity: 10 }] });
     await seedOrder({
       items: [
         { menuItem: salad.id, quantity: 1 },
@@ -467,19 +560,11 @@ describe("BestAndWorstSellers", () => {
       ],
     });
 
-    const { bestSellers, worstSellers } = await BestAndWorstSellers(
-      SHOP_A.toString(),
-    );
+    const { bestSellers } = await BestAndWorstSellers(SHOP_A.toString());
 
     expect(bestSellers.map((row) => [row.name.en, row.total])).toEqual([
       ["Burger", 12],
-      ["Pizza", 5],
       ["Salad", 1],
-    ]);
-    expect(worstSellers.map((row) => row.name.en)).toEqual([
-      "Salad",
-      "Pizza",
-      "Burger",
     ]);
   });
 
@@ -660,7 +745,10 @@ describe("BestAndWorstSellers", () => {
     );
 
     expect(bestSellers.map((row) => row.name.en)).toEqual(["C", "B"]);
-    expect(worstSellers.map((row) => row.name.en)).toEqual(["A", "B"]);
+    // Only "A" is left once the two best sellers are excluded — the limit is
+    // an upper bound on each list, not a quota to be filled by repeating a
+    // dish the owner has just been shown as a best seller.
+    expect(worstSellers.map((row) => row.name.en)).toEqual(["A"]);
   });
 
   it("returns two empty lists for a shop that has sold nothing", async () => {
@@ -671,12 +759,13 @@ describe("BestAndWorstSellers", () => {
   });
 
   /**
-   * CHARACTERISATION (see the report). Best and worst are the same aggregation
-   * sorted two ways, so a shop with fewer distinct sold items than `limit` gets
-   * the identical set presented twice — the top seller is also displayed as a
-   * worst seller. Pinned because it is a presentation decision, not a query bug.
+   * REGRESSION. Best and worst are one ranking read from both ends, so a shop
+   * with fewer distinct sold dishes than `limit` used to be shown the
+   * identical set twice — its single best seller presented as a worst seller
+   * too, on a brand new shop's dashboard, which is the first time anyone ever
+   * looks at the feature.
    */
-  it("CHARACTERISATION: with fewer items than the limit, best and worst are the same set reversed", async () => {
+  it("never lists the same dish as both a best and a worst seller", async () => {
     const only = await seedMenuItem("Solo");
     await seedOrder({
       items: [{ menuItem: only.id, quantity: 3 }],
@@ -687,16 +776,48 @@ describe("BestAndWorstSellers", () => {
       5,
     );
 
-    expect(bestSellers).toEqual(worstSellers);
+    expect(bestSellers.map((row) => row.name.en)).toEqual(["Solo"]);
+    // Suppressed rather than repeated: with one dish sold there is no
+    // comparison to make, and "your worst seller is your only seller" reads as
+    // a bug in the numbers.
+    expect(worstSellers).toEqual([]);
   });
 
   /**
-   * CHARACTERISATION. `$lookup` + `$unwind` without
-   * `preserveNullAndEmptyArrays` is an inner join: a dish that was sold and
-   * then deleted from the menu disappears from the report entirely rather than
-   * appearing as an unnamed row.
+   * Two dishes that sold exactly the same amount are the sharp edge of the
+   * rule above: without a deterministic tie-break the two pipelines are free
+   * to return the same row at the head of both lists. The secondary sort keys
+   * are exact mirrors of each other, so they cannot.
    */
-  it("CHARACTERISATION: drops sales of a menu item that has since been deleted", async () => {
+  it("keeps the lists disjoint even when every dish sold the same amount", async () => {
+    for (const name of ["Tie A", "Tie B", "Tie C", "Tie D"]) {
+      const item = await seedMenuItem(name);
+      await seedOrder({ items: [{ menuItem: item.id, quantity: 5 }] });
+    }
+
+    const { bestSellers, worstSellers } = await BestAndWorstSellers(
+      SHOP_A.toString(),
+      2,
+    );
+
+    expect(bestSellers).toHaveLength(2);
+    expect(worstSellers).toHaveLength(2);
+    const overlap = worstSellers.filter((worst) =>
+      bestSellers.some(
+        (best) => String(best.menuItemId) === String(worst.menuItemId),
+      ),
+    );
+    expect(overlap).toEqual([]);
+  });
+
+  /**
+   * REGRESSION. `$lookup` + `$unwind` without `preserveNullAndEmptyArrays` is
+   * an inner join: a dish that sold and was then deleted from the menu used to
+   * vanish from the report entirely, so a report about the past silently
+   * omitted exactly the history it exists to show — and the totals stayed
+   * plausible, so nothing prompted anyone to look.
+   */
+  it("keeps sales of a menu item that has since been deleted, labelled rather than dropped", async () => {
     const kept = await seedMenuItem("Kept");
     const deleted = new mongoose.Types.ObjectId();
 
@@ -709,7 +830,20 @@ describe("BestAndWorstSellers", () => {
 
     const { bestSellers } = await BestAndWorstSellers(SHOP_A.toString());
 
-    expect(bestSellers.map((row) => row.name.en)).toEqual(["Kept"]);
+    expect(bestSellers).toEqual([
+      // The id still resolves to the order line, so the row remains traceable
+      // even though the menu item behind it is gone.
+      {
+        menuItemId: deleted,
+        name: { en: "Deleted item", ar: "صنف محذوف" },
+        total: 50,
+      },
+      {
+        menuItemId: kept.id,
+        name: { en: "Kept", ar: "Kept بالعربية" },
+        total: 1,
+      },
+    ]);
   });
 });
 

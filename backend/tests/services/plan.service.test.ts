@@ -73,6 +73,13 @@ const seedPlan = (overrides: Partial<IPlan> = {}) =>
 
 beforeAll(async () => {
   await connectTestDB();
+  // Not optional. Mongoose builds indexes in the background, so without this
+  // the duplicate-plan test races the build of the unique (planGroup,
+  // frequency) index and passes or fails on scheduling. This project has
+  // already shipped a test that was green for weeks purely by winning that
+  // race (tests/models/subscription-entitlement.test.ts, 2026-08-24);
+  // `init()` makes the constraint genuinely in force before the first insert.
+  await Plans.init();
 });
 
 afterAll(async () => {
@@ -125,22 +132,57 @@ describe("createPlan", () => {
     expect(err.name).toBe("ValidationError");
   });
 
-  it("gap: nothing stops a second plan for the same group and frequency", async () => {
-    // Documented current behaviour, not an endorsement. The "one monthly and
-    // one yearly per group" rule lives entirely in `createPlanHandler`, which
-    // reads the existing plans and then writes — a check-then-act with no
-    // unique index behind it. Two concurrent creates therefore both pass the
-    // check, and any caller reaching the service directly bypasses it
-    // outright. The consequence is not cosmetic: the pricing page renders
-    // whatever comes back from `getAllPlans`, so a duplicate shows up as two
-    // identical-looking monthly plans at possibly different prices.
+  it("regression: refuses a second plan for the same group and frequency", async () => {
+    // The "one monthly and one yearly per group" rule used to live entirely in
+    // `createPlanHandler`, which reads the existing plans and then writes — a
+    // check-then-act with nothing behind it. Two concurrent creates both passed
+    // the check, and any caller reaching the service directly skipped it
+    // outright. It is not cosmetic: the pricing page renders whatever
+    // `getAllPlans` returns, so a duplicate shows up as two identical-looking
+    // monthly plans at possibly different prices, and a customer is billed
+    // against whichever one they clicked.
+    const { createPlan } = await planService();
+    await createPlan(planInput({ planGroup: "Starter", frequency: "monthly" }));
+
+    const err = await captureError(
+      createPlan(planInput({ planGroup: "Starter", frequency: "monthly" })),
+    );
+
+    // Translated, not raw: an untranslated E11000 is not a CustomError and
+    // reaches the admin as a 500 — "the server is broken" rather than "that
+    // plan already exists".
+    expect(err.message).toBe(errMsg.PLAN_ALREADY_EXISTS.en);
+    expect(err.statusCode).toBe(400);
+    expect(await Plans.countDocuments({ planGroup: "Starter" })).toBe(1);
+  });
+
+  it("still allows the other frequency, and the same frequency in another group", async () => {
+    // The other direction of the constraint, and the shape production actually
+    // holds: Starter and Pro, each monthly and yearly. A key that was too broad
+    // would take the live pricing table down rather than protect it.
     const { createPlan } = await planService();
     await createPlan(planInput({ planGroup: "Starter", frequency: "monthly" }));
 
     await expect(
-      createPlan(planInput({ planGroup: "Starter", frequency: "monthly" })),
+      createPlan(planInput({ planGroup: "Starter", frequency: "yearly" })),
     ).resolves.toBeDefined();
-    expect(await Plans.countDocuments({ planGroup: "Starter" })).toBe(2);
+    await expect(
+      createPlan(planInput({ planGroup: "Pro", frequency: "monthly" })),
+    ).resolves.toBeDefined();
+    expect(await Plans.countDocuments()).toBe(3);
+  });
+
+  it("lets an unrelated write error through untranslated", async () => {
+    // The duplicate-key translation must not become a catch-all: a validation
+    // failure reported as "a plan with this group and frequency already exists"
+    // would send an admin looking for a plan that does not exist.
+    const { createPlan } = await planService();
+    const input = planInput();
+    delete (input as Partial<IPlan>).price;
+
+    const err = await captureError(createPlan(input));
+
+    expect(err.name).toBe("ValidationError");
   });
 });
 
@@ -170,14 +212,13 @@ describe("getPlanById", () => {
     expect(err.statusCode).toBe(404);
   });
 
-  it("gap: a malformed id throws a CastError instead of a 404", async () => {
-    // `GET /plans/:id` is public and has no `isMongoId()` param validator
-    // (routes/plan.routes.ts:21), so this is directly reachable: any visitor
-    // requesting /plans/garbage gets a Mongoose CastError, which is not a
-    // CustomError and not one of the shapes the global error handler names —
-    // so it becomes a 500 and a Sentry event for what is plainly a bad
-    // request. Same on `GET /roles/:id`. Reported rather than fixed here: the
-    // right place for it is a param validator on the route.
+  it("throws a CastError for a malformed id, which the route now refuses first", async () => {
+    // Documents where the guard lives rather than endorsing this behaviour.
+    // `GET /plans/:id` is public, so `/plans/garbage` used to be an
+    // unauthenticated way to raise a Mongoose CastError — not a CustomError,
+    // and not a shape the global error handler names — which became a 500 and
+    // a Sentry event for a plainly bad request. Every `/plans/:id` route now
+    // carries `planIdParamValidator`, so that is a 422 before any handler runs.
     const { getPlanById } = await planService();
 
     const err = await captureError(getPlanById("not-an-object-id"));
@@ -188,7 +229,7 @@ describe("getPlanById", () => {
 });
 
 describe("getAllPlans", () => {
-  it("returns every plan", async () => {
+  it("returns every plan that is on sale", async () => {
     const { getAllPlans } = await planService();
     await seedPlan();
     await seedPlan({ planGroup: "Pro" });
@@ -205,24 +246,35 @@ describe("getAllPlans", () => {
     await expect(getAllPlans()).resolves.toEqual([]);
   });
 
-  it("gap: deactivated plans are still served to the public", async () => {
-    // Documented current behaviour, not an endorsement. `GET /plans` is
-    // unauthenticated and returns this list verbatim; the only thing hiding a
-    // deactivated plan is `plansApi.getActivePlans()` filtering client-side.
-    // Nothing on the server refuses a subscription to an inactive plan either
-    // — subscription.controller.ts fetches it with `getPlanById` and never
-    // reads `isActive` — so "deactivate" currently means "hide it in one of
-    // the two places the frontend asks". Left alone deliberately: `getAllPlans`
-    // is shared with the admin view, which legitimately needs to see inactive
-    // plans, so the fix is a parameter and a decision about who calls it, not
-    // a filter bolted on here.
+  it("regression: withholds deactivated plans from the public listing", async () => {
+    // `GET /plans` is unauthenticated and returns this list verbatim. The only
+    // thing that used to hide a deactivated plan was
+    // `plansApiService.getActivePlans()` filtering client-side — and its
+    // sibling `getPlans()` does not filter at all — so "deactivate" meant
+    // "hide it in one of the two places the frontend asks", which is not a
+    // control.
     const { getAllPlans } = await planService();
-    await seedPlan({ isActive: false });
+    await seedPlan({ planGroup: "Starter", isActive: true });
+    await seedPlan({ planGroup: "Retired", isActive: false });
 
     const plans = await getAllPlans();
 
     expect(plans).toHaveLength(1);
-    expect(plans[0].isActive).toBe(false);
+    expect(plans[0].planGroup).toBe("Starter");
+  });
+
+  it("serves the retired ones too when the caller asks for them", async () => {
+    // The other direction, and the one that keeps a deactivation reversible: an
+    // admin listing has to be able to see a plan it took off sale in order to
+    // put it back. No endpoint passes this yet — building one needs a handler
+    // in plans.controller.ts — so this pins the capability rather than a route.
+    const { getAllPlans } = await planService();
+    await seedPlan({ planGroup: "Starter", isActive: true });
+    await seedPlan({ planGroup: "Retired", isActive: false });
+
+    const plans = await getAllPlans({ includeInactive: true });
+
+    expect(plans).toHaveLength(2);
   });
 });
 

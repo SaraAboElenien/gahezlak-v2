@@ -2,7 +2,7 @@ import { IShop, Shops } from "../models/Shop";
 import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
 import mongoose, { FilterQuery, ProjectionFields, SortOrder } from "mongoose";
-import { Users } from "../models/User";
+import { IUser, Users } from "../models/User";
 import { Roles } from "../models/Role";
 import { hash } from "bcryptjs";
 import { SALT_ROUNDS } from "../config/bcrypt";
@@ -414,30 +414,90 @@ async function registerShopMember(
     throw new Errors.UnauthorizedError(errMsg.ROLE_NOT_ASSIGNABLE);
   }
 
+  const normalizedEmail = memberData.email.toLowerCase();
+
+  // Adding a staff member who already has an account is an ordinary mistake,
+  // not an exceptional one — without this the unique index on `Users.email`
+  // rejects the insert as a raw MongoServerError (code 11000), which the
+  // global handler flattens to a bare 500 and the owner reads as "the system
+  // is broken". The two messages are distinguished because they call for
+  // different actions: someone already on this roster needs no action at all,
+  // whereas an address belonging to an account elsewhere needs a different
+  // one. Enumeration is not a concern here — the caller is an authenticated
+  // shop owner or manager, and telling them the address is taken is the whole
+  // point of the check.
+  //
+  // The unique index remains the real guarantee: two simultaneous requests can
+  // both pass this check and one will still fail on the insert. That race is
+  // not worth serialising a staff form over; this turns the common case into a
+  // usable message rather than claiming to eliminate the collision.
+  const existingUser = await Users.findOne({ email: normalizedEmail })
+    .select("_id")
+    .lean();
+  if (existingUser) {
+    const alreadyOnThisRoster = shop.members.some(
+      (m) => m.userId.toString() === existingUser._id.toString(),
+    );
+    throw new Errors.BadRequestError(
+      alreadyOnThisRoster
+        ? errMsg.MEMBER_ALREADY_EXISTS
+        : errMsg.EMAIL_ALREADY_IN_USE,
+    );
+  }
+
   // Hash password
   const hashedPassword = await hash(memberData.password, SALT_ROUNDS);
 
-  // Create the new user
-  const newUser = await Users.create({
-    firstName: memberData.firstName,
-    lastName: memberData.lastName,
-    email: memberData.email.toLowerCase(),
-    password: hashedPassword,
-    phoneNumber: memberData.phoneNumber,
-    role: new mongoose.Types.ObjectId(memberData.roleId),
-    shop: new mongoose.Types.ObjectId(shopId),
-    isVerified: true, // Shop members are automatically verified
-  });
+  // Creating the account and listing it on the roster must succeed or fail
+  // together — the same reasoning `removeMemberFromShop` below documents, read
+  // in the other direction. A failure between the two used to leave a fully
+  // functional, already-verified user account that the shop does not list and
+  // that nothing ever cleans up: invisible on the members page, but able to
+  // log in and carrying a `shop` link that scopes its access token. Expressed
+  // as self-contained writes rather than mutating the `shop` document fetched
+  // above, since withTransaction may retry this callback.
+  const session = await mongoose.startSession();
+  // Definite-assignment: `withTransaction` resolves only once the callback has
+  // run to completion, and it throws rather than resolving if it never does.
+  let newUser!: mongoose.HydratedDocument<IUser>;
+  try {
+    await session.withTransaction(async () => {
+      [newUser] = await Users.create(
+        [
+          {
+            firstName: memberData.firstName,
+            lastName: memberData.lastName,
+            email: normalizedEmail,
+            password: hashedPassword,
+            phoneNumber: memberData.phoneNumber,
+            role: new mongoose.Types.ObjectId(memberData.roleId),
+            shop: new mongoose.Types.ObjectId(shopId),
+            isVerified: true, // Shop members are automatically verified
+          },
+        ],
+        { session },
+      );
 
-  // Add member to shop
-  shop.members.push({
-    // IUser declares `_id` with mongoose's schema-level `ObjectId` type rather
-    // than the runtime `Types.ObjectId` class IShopMember uses, so the two
-    // don't line up structurally even though they're the same value.
-    userId: new mongoose.Types.ObjectId(newUser._id.toString()),
-    roleId: new mongoose.Types.ObjectId(memberData.roleId),
-  });
-  await shop.save();
+      await Shops.updateOne(
+        { _id: shopId },
+        {
+          $push: {
+            members: {
+              // IUser declares `_id` with mongoose's schema-level `ObjectId`
+              // type rather than the runtime `Types.ObjectId` class
+              // IShopMember uses, so the two don't line up structurally even
+              // though they're the same value.
+              userId: new mongoose.Types.ObjectId(newUser._id.toString()),
+              roleId: new mongoose.Types.ObjectId(memberData.roleId),
+            },
+          },
+        },
+        { session },
+      );
+    });
+  } finally {
+    await session.endSession();
+  }
 
   // Return user data without password
   const { _id, firstName, lastName, email, phoneNumber } = newUser.toObject();

@@ -134,13 +134,13 @@ describe("getRoleById", () => {
     expect(err.statusCode).toBe(404);
   });
 
-  it("gap: a malformed id throws a CastError instead of a 404", async () => {
-    // `GET /roles/:id` has no `isMongoId()` param validator
-    // (routes/role.routes.ts:25), so a CastError — which is neither a
-    // CustomError nor one of the shapes the global error handler names —
-    // becomes a 500 and a Sentry event for a plainly bad request. Admin-only
-    // here, so low severity; reported rather than fixed, because the right
-    // place for it is a param validator on the route.
+  it("throws a CastError for a malformed id, which the route now refuses first", async () => {
+    // Documents where the guard lives rather than endorsing this behaviour.
+    // Every `/roles/:id` route now carries `roleIdParamValidator`, so a
+    // malformed id is a 422 before any handler runs; reaching the service with
+    // one is no longer possible through the API. The service itself is left
+    // uncast deliberately — moving the check here as well would duplicate it,
+    // and the validator is the layer that can name the offending field.
     const { getRoleById } = await roleService();
 
     const err = await captureError(getRoleById("not-an-object-id"));
@@ -301,19 +301,14 @@ describe("updateRole", () => {
     expect(err.statusCode).toBe(404);
   });
 
-  it("hazard: renaming a role silently re-grants everyone who holds it", async () => {
-    // Documented current behaviour, not an endorsement, and the reason this
-    // endpoint deserves more care than "admin-only" suggests. `isAllowed`
-    // decides privilege by reading `role.name` through the user's `role`
-    // reference, and `Roles.name` carries no unique index — so renaming the
-    // kitchen role to "admin" does not create a new admin account, it promotes
-    // every existing kitchen user at once, with nothing in the users
-    // collection changing. The obvious-looking action ("fix the label on this
-    // role") is the dangerous one.
-    //
-    // Reported rather than fixed: the guard wants to be a unique index on
-    // `Roles.name` plus a migration for any duplicates already in the
-    // production database, which is a data change and not a code change.
+  it("regression: refuses to rename a role into a reserved name", async () => {
+    // The privilege-escalation half. `isAllowed` decides what a request may do
+    // by reading `role.name` through the user's `role` reference, and
+    // `Roles.name` carries no unique index — so renaming the kitchen role to
+    // "admin" does not create a new admin account, it promotes every existing
+    // kitchen user at once, with nothing in the users collection changing.
+    // Before the guard this test asserted exactly that, as documented
+    // behaviour.
     const { updateRole } = await roleService();
     const roles = await seedAllRoles();
     const kitchenRole = roles.get(Role.KITCHEN)!;
@@ -326,14 +321,73 @@ describe("updateRole", () => {
       role: kitchenRole._id,
     });
 
-    await updateRole(kitchenRole._id.toString(), { name: Role.ADMIN });
+    const err = await captureError(
+      updateRole(kitchenRole._id.toString(), { name: Role.ADMIN }),
+    );
 
-    // What `isAllowed` would now resolve for that user.
+    expect(err.message).toBe(errMsg.ROLE_NAME_RESERVED.en);
+    expect(err.statusCode).toBe(400);
+    // Nothing was written, so what `isAllowed` resolves for the cook is
+    // unchanged — the assertion that matters, since the stored name *is* the
+    // privilege.
     const resolved = await Users.findById(cook._id)
       .populate<{ role: { name: string } }>("role", "name")
       .lean();
-    expect(resolved!.role.name).toBe(Role.ADMIN);
-    expect(await Roles.countDocuments({ name: Role.ADMIN })).toBe(2);
+    expect(resolved!.role.name).toBe(Role.KITCHEN);
+    expect(await Roles.countDocuments({ name: Role.ADMIN })).toBe(1);
+  });
+
+  it.each([Role.ADMIN, Role.SHOP_OWNER, Role.USER])(
+    "regression: refuses to rename the %s role away from its name",
+    async (reserved) => {
+      // The other direction, and it is not symmetrical hand-wringing: renaming
+      // `user` to anything stops `signUp`, which finds that role *by name* to
+      // stamp every new account, so registration dies platform-wide. Renaming
+      // `admin` or `shop_owner` silently strips the privilege from everyone
+      // holding it.
+      const { updateRole } = await roleService();
+      const roles = await seedAllRoles();
+
+      const err = await captureError(
+        updateRole(roles.get(reserved)!._id.toString(), {
+          name: Role.KITCHEN,
+        }),
+      );
+
+      expect(err.message).toBe(errMsg.ROLE_NAME_RESERVED.en);
+      expect(await Roles.findOne({ name: reserved }).lean()).not.toBeNull();
+    },
+  );
+
+  it("still renames freely between non-reserved roles", async () => {
+    // The other direction of the guard. A rename that moves no privilege
+    // across the reserved boundary is an ordinary edit and must keep working —
+    // this codebase has shipped a guard that refused legitimate updates while
+    // still returning 200 before.
+    const { updateRole } = await roleService();
+    const role = await Roles.create({ name: Role.SHOP_STAFF });
+
+    const updated = await updateRole(role._id.toString(), {
+      name: Role.KITCHEN,
+    });
+
+    expect(updated.name).toBe(Role.KITCHEN);
+  });
+
+  it("lets a reserved role be edited as long as its name is unchanged", async () => {
+    // Round-tripping a fetched object — GET the role, change `permissions`, PUT
+    // the whole thing back — resends the name it already has. Refusing that
+    // would make the three reserved roles uneditable, which is a different bug
+    // rather than a stricter version of the same guard.
+    const { updateRole } = await roleService();
+    const role = await Roles.create({ name: Role.ADMIN, permissions: [] });
+
+    const updated = await updateRole(role._id.toString(), {
+      name: Role.ADMIN,
+      permissions: ["*"],
+    });
+
+    expect(updated.permissions).toEqual(["*"]);
   });
 });
 
@@ -359,18 +413,11 @@ describe("deleteRole", () => {
     expect(err.statusCode).toBe(404);
   });
 
-  it("hazard: deleting a role in use locks its holders out with no warning", async () => {
-    // Documented current behaviour, not an endorsement. There is no reference
-    // check, so the role can be removed while users still point at it. Their
-    // `role` reference is left dangling, `isAllowed` populates it to null, and
-    // `!currentRole` sends every gated request to 403 — the accounts still log
-    // in, they simply cannot do anything, and nothing anywhere says why.
-    // Deleting the `user` role is worse still: `signUp` looks it up by name to
-    // stamp new accounts, so registration stops for everyone.
-    //
-    // Reported rather than fixed: refusing the delete needs an error message
-    // that does not exist yet in common/err-messages.ts, and the alternative
-    // (reassign holders to a fallback role) is a product decision.
+  it("regression: refuses to delete a role while a user still holds it", async () => {
+    // Before the reference check the delete succeeded and left the holder's
+    // `role` reference dangling: `isAllowed` populates it to null, `!currentRole`
+    // sends every gated request to 403, and the account still logs in perfectly
+    // well while being unable to do anything — with nothing anywhere saying why.
     const { deleteRole } = await roleService();
     const staffRole = await Roles.create({ name: Role.SHOP_STAFF });
     const staff = await Users.create({
@@ -382,11 +429,76 @@ describe("deleteRole", () => {
       role: staffRole._id,
     });
 
-    await deleteRole(staffRole._id.toString());
+    const err = await captureError(deleteRole(staffRole._id.toString()));
 
+    expect(err.message).toBe(errMsg.ROLE_IN_USE.en);
+    expect(err.statusCode).toBe(400);
+    // The role is still there, so the holder still resolves to it.
     const resolved = await Users.findById(staff._id)
       .populate<{ role: { name: string } | null }>("role", "name")
       .lean();
-    expect(resolved!.role).toBeNull();
+    expect(resolved!.role).not.toBeNull();
+    expect(await Roles.findById(staffRole._id).lean()).not.toBeNull();
+  });
+
+  it.each([Role.ADMIN, Role.SHOP_OWNER, Role.USER])(
+    "regression: refuses to delete the %s role even when nobody holds it",
+    async (reserved) => {
+      // Emptiness is not safety here: these three names are resolved by string
+      // elsewhere in the code, and an unheld `user` role is exactly as fatal to
+      // registration as a populated one — `signUp` looks it up by name to stamp
+      // every new account.
+      const { deleteRole } = await roleService();
+      const role = await Roles.create({ name: reserved });
+
+      const err = await captureError(deleteRole(role._id.toString()));
+
+      expect(err.message).toBe(errMsg.ROLE_NAME_RESERVED.en);
+      expect(await Roles.findById(role._id).lean()).not.toBeNull();
+    },
+  );
+
+  it("deletes a role again once its last holder has moved off it", async () => {
+    // The other direction. The guard must be a step an administrator can
+    // satisfy, not a permanent refusal: reassign the holders, then the delete
+    // goes through.
+    const { deleteRole } = await roleService();
+    const staffRole = await Roles.create({ name: Role.SHOP_STAFF });
+    const kitchenRole = await Roles.create({ name: Role.KITCHEN });
+    const staff = await Users.create({
+      firstName: "Some",
+      lastName: "Staff",
+      email: "staff@example.com",
+      password: "hashed",
+      phoneNumber: "01000000000",
+      role: staffRole._id,
+    });
+
+    await Users.updateOne({ _id: staff._id }, { role: kitchenRole._id });
+    const deleted = await deleteRole(staffRole._id.toString());
+
+    expect(deleted.name).toBe(Role.SHOP_STAFF);
+    expect(await Roles.findById(staffRole._id)).toBeNull();
+  });
+
+  it("counts holders of this role only", async () => {
+    // Scoping matters: counting every user, or every user with any role, would
+    // make the guard a blanket refusal on any platform with users on it — which
+    // would look identical to "delete is broken".
+    const { deleteRole } = await roleService();
+    const staffRole = await Roles.create({ name: Role.SHOP_STAFF });
+    const kitchenRole = await Roles.create({ name: Role.KITCHEN });
+    await Users.create({
+      firstName: "A",
+      lastName: "Cook",
+      email: "cook@example.com",
+      password: "hashed",
+      phoneNumber: "01000000000",
+      role: kitchenRole._id,
+    });
+
+    await expect(deleteRole(staffRole._id.toString())).resolves.toMatchObject({
+      name: Role.SHOP_STAFF,
+    });
   });
 });

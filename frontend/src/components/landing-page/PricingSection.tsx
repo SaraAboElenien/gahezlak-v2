@@ -9,7 +9,7 @@ import {
 } from "../ui/card";
 import { Button } from "../ui/button";
 import { Check, Star, Zap, Gift, Loader2 } from "lucide-react";
-import { useSpecificPlanWithFallback } from "../../hooks/usePlans";
+import { useAdvertisedPlan } from "../../hooks/usePlans";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
@@ -17,11 +17,7 @@ export default function PricingSection() {
   const navigate = useNavigate();
   const { t } = useTranslation();
 
-  const {
-    data: plan,
-    isLoading,
-    error,
-  } = useSpecificPlanWithFallback("688399b2e32b453c443937ff");
+  const { data: plan, isLoading, error } = useAdvertisedPlan();
 
   // Show loading state
   if (isLoading) {

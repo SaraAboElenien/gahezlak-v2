@@ -1,5 +1,16 @@
-import { body } from "express-validator";
+import { body, param } from "express-validator";
 import { validate } from "../middlewares/validators";
+
+/**
+ * Every `/plans/:id` route needs this, and `GET` needs it most: that route is
+ * public, so `/plans/garbage` was an unauthenticated way to make Mongoose throw
+ * a CastError — not a `CustomError`, and not a shape the global error handler
+ * names — which surfaced as a 500 and a Sentry event for a plainly bad request.
+ */
+export const planIdParamValidator = [
+  param("id").isMongoId().withMessage("Invalid plan ID"),
+  validate,
+];
 
 export const createPlanValidator = [
   body("planGroup")

@@ -82,7 +82,7 @@ async function seedUserRole() {
 
 async function register(email = EMAIL, password = PASSWORD) {
   const { signUp } = await import("../../services/auth.service");
-  await signUp({
+  return signUp({
     firstName: "Test",
     lastName: "User",
     email,
@@ -114,11 +114,21 @@ async function registerAndVerify(email = EMAIL, password = PASSWORD) {
   return { ...tokens, userId: created._id.toString() };
 }
 
-async function expireStoredCode(email = EMAIL) {
+/**
+ * The three OTP flows each own a slot on the user document (see models/User.ts).
+ * Tests name the slot they mean rather than assuming one shared field — the
+ * whole point of the split is that writing one must not disturb the others.
+ */
+type OtpSlotName = "verificationCode" | "passwordResetCode" | "emailChangeCode";
+
+async function expireStoredCode(
+  email = EMAIL,
+  slot: OtpSlotName = "verificationCode",
+) {
   const { Users } = await import("../../models/User");
   await Users.updateOne(
     { email: email.toLowerCase() },
-    { $set: { "verificationCode.expireAt": new Date(Date.now() - 1000) } },
+    { $set: { [`${slot}.expireAt`]: new Date(Date.now() - 1000) } },
   );
 }
 
@@ -255,13 +265,69 @@ describe("signUp", () => {
     // carried a `.catch(console.error)` that could never fire.
     sendEmailMock.mockResolvedValue(false);
 
-    await expect(register()).resolves.toBeUndefined();
+    await expect(register()).resolves.toBeDefined();
 
     // Deliberate: a mail outage must not roll back a valid registration. The
     // account is recoverable via resend-verification-code, whereas deleting the
     // row would discard the user's password over a transient relay failure.
     const user = await storedUser();
     expect(user.verificationCode.code).toHaveLength(6);
+  });
+
+  it("reports a failed verification email to the caller, not only to the log", async () => {
+    // The operator-facing log line below is necessary but not sufficient: the
+    // person who just registered is told "check your email" for an inbox that
+    // will never receive anything, so they wait, check spam, and conclude the
+    // product is broken — while the unverified row blocks them from
+    // re-registering the same address. The flag is what lets the response say
+    // "press Resend" instead.
+    sendEmailMock.mockResolvedValue(false);
+
+    await expect(register()).resolves.toEqual({
+      verificationEmailSent: false,
+    });
+  });
+
+  it("reports a successful verification email as sent", async () => {
+    // Control for the test above: the flag has to distinguish the two
+    // outcomes, not merely exist. A flag that is always false would satisfy
+    // the failure assertion on its own.
+    await expect(register()).resolves.toEqual({
+      verificationEmailSent: true,
+    });
+  });
+
+  // Enumeration boundary, stated as a test because the reasoning is easy to
+  // lose. `signUp` may branch its response on delivery ONLY because it already
+  // discloses whether an address is registered — a duplicate registration
+  // throws a unique-index error. `resendVerificationCode` and `forgotPassword`
+  // deliberately do the opposite (see their own tests): they are reachable
+  // unauthenticated for any address, so a response that varied with delivery
+  // would rebuild the account-enumeration oracle those endpoints were changed
+  // to close, since mail is only ever sent for addresses that exist.
+  it("does not let the resend endpoint branch its answer on delivery", async () => {
+    const { resendVerificationCode } =
+      await import("../../services/auth.service");
+    await register();
+
+    sendEmailMock.mockResolvedValue(true);
+    const delivered = await resendVerificationCode({ email: EMAIL });
+    sendEmailMock.mockResolvedValue(false);
+    const undelivered = await resendVerificationCode({ email: EMAIL });
+
+    expect(undelivered).toEqual(delivered);
+  });
+
+  it("does not let the forgot-password endpoint branch its answer on delivery", async () => {
+    const { forgotPassword } = await import("../../services/auth.service");
+    await registerAndVerify();
+
+    sendEmailMock.mockResolvedValue(true);
+    const delivered = await forgotPassword({ email: EMAIL });
+    sendEmailMock.mockResolvedValue(false);
+    const undelivered = await forgotPassword({ email: EMAIL });
+
+    expect(undelivered).toEqual(delivered);
   });
 
   // Regression for the silent-failure bug this file's header describes: a
@@ -488,8 +554,9 @@ describe("verifyCode", () => {
       verifyCode({ email: EMAIL, code, reason: "password_reset" }),
     );
 
-    // The reason field is what keeps the two OTP flows apart; both write to
-    // the same single `verificationCode` slot on the user.
+    // Each flow now owns its slot, but the reason guard is kept as defence in
+    // depth and this is what still rejects a caller that simply asks for the
+    // wrong one against a perfectly valid code.
     expect(err.message).toMatch(/reason/i);
     expect((await storedUser()).isVerified).toBe(false);
   });
@@ -505,10 +572,19 @@ describe("verifyCode", () => {
       await import("../../services/auth.service");
     await register();
     await forgotPassword({ email: EMAIL });
-    const code = (await storedUser()).verificationCode.code!;
+    // The real reset code, read from the slot that now holds it. Reading the
+    // old shared slot here would silently pick up the *signup* code instead
+    // and the test would pass without exercising anything.
+    const code = (await storedUser()).passwordResetCode.code!;
 
+    // Rejected under either reason: "password_reset" fails VERIFIABLE_REASON,
+    // and "account_verification" cannot find the code at all because it is not
+    // in the slot this endpoint reads.
     await expect(
       verifyCode({ email: EMAIL, code, reason: "password_reset" }),
+    ).rejects.toThrow();
+    await expect(
+      verifyCode({ email: EMAIL, code, reason: "account_verification" }),
     ).rejects.toThrow();
     expect((await storedUser()).isVerified).toBe(false);
   });
@@ -594,12 +670,60 @@ describe("forgotPassword", () => {
     await forgotPassword({ email: EMAIL });
 
     const user = await storedUser();
-    expect(user.verificationCode.reason).toBe("password_reset");
-    expect(user.verificationCode.code).toHaveLength(6);
-    const ttl = new Date(user.verificationCode.expireAt!).getTime() - before;
+    // `passwordResetCode`, not the shared slot this used to write: a reset must
+    // not land in the account-verification slot, where verifyCode could see it.
+    expect(user.passwordResetCode.reason).toBe("password_reset");
+    expect(user.passwordResetCode.code).toHaveLength(6);
+    const ttl = new Date(user.passwordResetCode.expireAt!).getTime() - before;
     expect(ttl).toBeLessThanOrEqual(10 * 60 * 1000 + 1000);
-    const [, , html] = sendEmailMock.mock.calls.at(-1) as string[];
-    expect(html).toContain(user.verificationCode.code);
+    const calls = sendEmailMock.mock.calls;
+    // Indexed rather than `.at(-1)`: the backend targets ES2020, where `.at`
+    // is not in lib.
+    const [, , html] = calls[calls.length - 1] as string[];
+    expect(html).toContain(user.passwordResetCode.code);
+  });
+
+  it("does not disturb an account-verification code that is still outstanding", async () => {
+    // The bug the slot split exists to fix. All three OTP flows used to write
+    // one `verificationCode` sub-document, so asking for a password reset
+    // silently destroyed the signup code the same person was at that moment
+    // reading out of their inbox — and the natural response, requesting
+    // another, is what caused it. Nothing told them, and the symptom reads as
+    // a mail-delivery problem.
+    const { forgotPassword, verifyCode } =
+      await import("../../services/auth.service");
+    await register();
+    const signupCode = (await storedUser()).verificationCode.code!;
+
+    await forgotPassword({ email: EMAIL });
+
+    // Survives byte-for-byte, and — the part that actually matters — still works.
+    expect((await storedUser()).verificationCode.code).toBe(signupCode);
+    await expect(
+      verifyCode({
+        email: EMAIL,
+        code: signupCode,
+        reason: "account_verification",
+      }),
+    ).resolves.toMatchObject({ accessToken: expect.any(String) });
+  });
+
+  it("does not disturb an email-change request that is still outstanding", async () => {
+    // The third flow, from the other direction: an authenticated user with a
+    // pending email change asks for a password reset. Both codes must remain
+    // live, because the person is plausibly mid-way through both.
+    const { forgotPassword } = await import("../../services/auth.service");
+    const { requestEmailChange, confirmEmailChange } =
+      await import("../../services/user.service");
+    const session = await registerAndVerify();
+    await requestEmailChange(session.userId, "moved@example.com");
+    const changeCode = (await storedUser()).emailChangeCode.code!;
+
+    await forgotPassword({ email: EMAIL });
+
+    await expect(
+      confirmEmailChange(session.userId, changeCode),
+    ).resolves.toMatchObject({ user: { email: "moved@example.com" } });
   });
 
   // Regression: forgotPassword used to throw NotFoundError / 404 for an address
@@ -634,7 +758,7 @@ describe("resetPassword", () => {
   async function startReset(email = EMAIL) {
     const { forgotPassword } = await import("../../services/auth.service");
     await forgotPassword({ email });
-    return (await storedUser(email)).verificationCode.code!;
+    return (await storedUser(email)).passwordResetCode.code!;
   }
 
   it("replaces the password so the user can log in with the new one", async () => {
@@ -677,7 +801,7 @@ describe("resetPassword", () => {
     const { resetPassword } = await import("../../services/auth.service");
     await registerAndVerify();
     const code = await startReset();
-    await expireStoredCode();
+    await expireStoredCode(EMAIL, "passwordResetCode");
 
     const err = await captureError(
       resetPassword({ email: EMAIL, code, newPassword: OTHER_PASSWORD }),
@@ -730,12 +854,80 @@ describe("resetPassword", () => {
       }),
     );
 
-    // Both flows share one `verificationCode` slot, so the reason guard is the
-    // only thing stopping a signup OTP from rewriting the password.
+    // The security property is unchanged; only the mechanism moved. The two
+    // flows used to share one `verificationCode` slot, so the `reason` guard
+    // was the ONLY thing stopping a signup OTP from rewriting the password —
+    // and the message said so. Reset now reads `passwordResetCode`, a slot
+    // signup never writes, so the signup code is not merely rejected but
+    // invisible: hence "no verification code" rather than "invalid reason".
+    // Assert the outcome that matters — the password is untouched — and pin
+    // the structural separation, so a regression that merges the slots again
+    // fails here rather than quietly falling back to the reason check.
+    expect(err.message).toMatch(/no verification code/i);
+    await expect(
+      compare(PASSWORD, (await storedUser()).password),
+    ).resolves.toBe(true);
+  });
+
+  it("refuses a code sitting in the reset slot under another flow's reason", async () => {
+    // Defence in depth, and the reason the `reason` guard was kept after the
+    // slots were split (see models/User.ts). The slot separation is a
+    // structural barrier; this is the one that still fires if some future
+    // write puts a code in the wrong slot. Without it that write would be
+    // silently authorised as a password reset.
+    const { resetPassword } = await import("../../services/auth.service");
+    const { Users } = await import("../../models/User");
+    await registerAndVerify();
+    await Users.updateOne(
+      { email: EMAIL },
+      {
+        $set: {
+          passwordResetCode: {
+            code: "654321",
+            expireAt: new Date(Date.now() + 10 * 60 * 1000),
+            reason: "email_change",
+          },
+        },
+      },
+    );
+
+    const err = await captureError(
+      resetPassword({
+        email: EMAIL,
+        code: "654321",
+        newPassword: OTHER_PASSWORD,
+      }),
+    );
+
     expect(err.message).toMatch(/reason/i);
     await expect(
       compare(PASSWORD, (await storedUser()).password),
     ).resolves.toBe(true);
+  });
+
+  it("consumes only its own slot, leaving a pending signup code alone", async () => {
+    // The mirror of the forgotPassword isolation tests: consuming a reset must
+    // not clear the other flows either. A shared slot made "reset your
+    // password" also mean "your signup code is now dead".
+    const { resetPassword, verifyCode } =
+      await import("../../services/auth.service");
+    await register();
+    const signupCode = (await storedUser()).verificationCode.code!;
+    const resetCode = await startReset();
+
+    await resetPassword({
+      email: EMAIL,
+      code: resetCode,
+      newPassword: OTHER_PASSWORD,
+    });
+
+    await expect(
+      verifyCode({
+        email: EMAIL,
+        code: signupCode,
+        reason: "account_verification",
+      }),
+    ).resolves.toMatchObject({ accessToken: expect.any(String) });
   });
 
   it("consumes the code so the same reset cannot be replayed", async () => {

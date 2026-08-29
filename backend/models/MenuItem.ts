@@ -1,8 +1,8 @@
-import mongoose, { Schema, ObjectId } from "mongoose";
+import mongoose, { Schema, ObjectId, Types } from "mongoose";
 import { collectionsName } from "../common/collections-name";
 
 export interface IMenuItem {
-  _id: ObjectId;
+  _id: Types.ObjectId;
   shopId: ObjectId;
   name: {
     en: string;

@@ -20,11 +20,55 @@ import { logger } from "../config/pino";
  */
 let cachedTransporter: Transporter | null = null;
 
+/**
+ * The SMTP credentials were originally named `sendEmail` / `emailPassword` —
+ * the last two lowercase env vars in the backend, and confusingly named on top
+ * of it (`sendEmail` is also this module's export). They are now `SMTP_USER` /
+ * `SMTP_PASSWORD`, matching `SMTP_HOST` and `SMTP_PORT` beside them.
+ *
+ * The old names are still read as a fallback ON PURPOSE. These values live in
+ * the hosting platform's dashboard, not in the repository, so a hard rename
+ * breaks outbound mail the moment it deploys and stays broken until someone
+ * notices — and the symptom of broken mail here is a successful-looking signup
+ * with no email, which is precisely the failure this project has already spent
+ * a session chasing. The fallback makes the code change deployable on its own,
+ * and the deprecation warning is what tells the operator there is still
+ * something to do.
+ *
+ * REMOVE THE FALLBACK once the platform environment is confirmed renamed.
+ */
+const LEGACY_ENV_NAMES = {
+  SMTP_USER: "sendEmail",
+  SMTP_PASSWORD: "emailPassword",
+} as const;
+
+let legacyEnvWarned = false;
+
+function readSmtpCredential(name: keyof typeof LEGACY_ENV_NAMES) {
+  const current = process.env[name];
+  if (current) return current;
+
+  const legacyName = LEGACY_ENV_NAMES[name];
+  const legacy = process.env[legacyName];
+  if (legacy && !legacyEnvWarned) {
+    // Warned once per process rather than per message: a busy relay would
+    // otherwise bury every other log line under a notice nobody can act on
+    // from inside a request.
+    legacyEnvWarned = true;
+    logger.warn(
+      { legacyName, replacement: name },
+      `Email is configured through the deprecated env var "${legacyName}". ` +
+        `Rename it to "${name}" in the hosting environment; the fallback will be removed.`,
+    );
+  }
+  return legacy;
+}
+
 const getTransporter = (): { transporter: Transporter; from: string } => {
   // Read at call time, not module load, so the check reflects the environment
   // as it actually is when mail is sent.
-  const user = process.env.sendEmail;
-  const pass = process.env.emailPassword;
+  const user = readSmtpCredential("SMTP_USER");
+  const pass = readSmtpCredential("SMTP_PASSWORD");
 
   if (!user || !pass) {
     throw new Error("Email credentials are not set in environment variables.");

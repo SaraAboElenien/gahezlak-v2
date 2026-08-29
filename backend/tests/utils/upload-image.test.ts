@@ -54,7 +54,9 @@ function res(opts: {
 
 const logged = () =>
   errorSpy.mock.calls
-    .map((c) => JSON.stringify(c[0] ?? "") + " " + String(c[1] ?? ""))
+    .map(
+      (c: unknown[]) => JSON.stringify(c[0] ?? "") + " " + String(c[1] ?? ""),
+    )
     .join("\n");
 
 beforeEach(() => {

@@ -34,115 +34,46 @@ export const useActivePlans = () => {
   });
 };
 
-// Hook to get a single plan by ID
-export const usePlanById = (planId: string) => {
+/**
+ * The plan the marketing site advertises, and the one the subscription form
+ * offers. Selected by WHAT IT IS rather than by id.
+ *
+ * Both call sites used to hardcode the ObjectId `688399b2e32b453c443937ff`,
+ * which belonged to an older database and does not exist in this one. Every
+ * landing-page view therefore fired a guaranteed-404 `GET /plans/<id>`, and a
+ * withFallback wrapper quietly swallowed it and substituted
+ * `getActivePlans()[0]`. Two things were wrong with that, and the second is
+ * the worse one:
+ *
+ *   - a wasted round trip that always failed, doubling the section's render
+ *     time on the free tier's cold start and burying real 404s in the log;
+ *   - the advertised price was not a chosen plan at all. It was whatever
+ *     happened to sort first, so adding or reordering a plan would silently
+ *     change the price on the public page with nothing looking broken.
+ *
+ * Selecting on `planGroup` + `frequency` is stable against reordering, cannot
+ * 404, and states the intent in the code. When the advertised plan is absent
+ * the hook resolves to `null` so the caller can say so, rather than
+ * advertising a different plan's price.
+ */
+export const ADVERTISED_PLAN = {
+  planGroup: "Starter",
+  frequency: "monthly",
+} as const;
+
+export const useAdvertisedPlan = () => {
   return useQuery({
-    queryKey: plansQueryKeys.detail(planId),
-    queryFn: () => plansApiService.getPlanById(planId),
-    enabled: !!planId, // Only run query if planId is provided
-    staleTime: 5 * 60 * 1000, // 5 minutes
-    gcTime: 10 * 60 * 1000, // 10 minutes
+    queryKey: [...plansQueryKeys.active(), "advertised"],
+    // `getActivePlans` requests /plans and drops inactive ones, so a retired
+    // plan left in the collection can never become the advertised price.
+    queryFn: plansApiService.getActivePlans,
+    select: (plans) =>
+      plans.find(
+        (plan) =>
+          plan.planGroup === ADVERTISED_PLAN.planGroup &&
+          plan.frequency === ADVERTISED_PLAN.frequency,
+      ) ?? null,
+    staleTime: 5 * 60 * 1000,
+    gcTime: 10 * 60 * 1000,
   });
-};
-
-// Hook to get the first active plan (useful for pricing sections)
-export const useFirstActivePlan = () => {
-  return useQuery({
-    queryKey: [...plansQueryKeys.active(), "first"],
-    queryFn: async () => {
-      const activePlans = await plansApiService.getActivePlans();
-      return activePlans[0] || null;
-    },
-    staleTime: 5 * 60 * 1000, // 5 minutes
-    gcTime: 10 * 60 * 1000, // 10 minutes
-  });
-};
-
-// Hook to get a specific plan by ID (recommended for consistent pricing)
-export const useSpecificPlan = (planId: string) => {
-  return useQuery({
-    queryKey: plansQueryKeys.detail(planId),
-    queryFn: () => plansApiService.getPlanById(planId),
-    enabled: !!planId, // Only run query if planId is provided
-    staleTime: 5 * 60 * 1000, // 5 minutes
-    gcTime: 10 * 60 * 1000, // 10 minutes
-  });
-};
-
-// Hook to get plan by planGroup (e.g., "Premium")
-export const usePlanByGroup = (planGroup: string) => {
-  return useQuery({
-    queryKey: [...plansQueryKeys.active(), "group", planGroup],
-    queryFn: async () => {
-      const activePlans = await plansApiService.getActivePlans();
-      return activePlans.find((plan) => plan.planGroup === planGroup) || null;
-    },
-    enabled: !!planGroup,
-    staleTime: 5 * 60 * 1000, // 5 minutes
-    gcTime: 10 * 60 * 1000, // 10 minutes
-  });
-};
-
-// Hook to get specific plan with fallback to first active plan
-export const useSpecificPlanWithFallback = (planId: string) => {
-  const specificPlanQuery = useSpecificPlan(planId);
-  const firstActivePlanQuery = useFirstActivePlan();
-
-  // If specific plan is loading, show loading
-  if (specificPlanQuery.isLoading) {
-    return {
-      data: null,
-      isLoading: true,
-      error: null,
-      source: "specific" as const,
-    };
-  }
-
-  // If specific plan has error but first active plan is available, use fallback
-  if (specificPlanQuery.error && firstActivePlanQuery.data) {
-    return {
-      data: firstActivePlanQuery.data,
-      isLoading: false,
-      error: null,
-      source: "fallback" as const,
-    };
-  }
-
-  // If specific plan has error and first active plan is also loading, show loading
-  if (specificPlanQuery.error && firstActivePlanQuery.isLoading) {
-    return {
-      data: null,
-      isLoading: true,
-      error: null,
-      source: "fallback" as const,
-    };
-  }
-
-  // If specific plan has error and first active plan also has error, show error
-  if (specificPlanQuery.error && firstActivePlanQuery.error) {
-    return {
-      data: null,
-      isLoading: false,
-      error: specificPlanQuery.error,
-      source: "error" as const,
-    };
-  }
-
-  // If specific plan is successful, use it
-  if (specificPlanQuery.data) {
-    return {
-      data: specificPlanQuery.data,
-      isLoading: false,
-      error: null,
-      source: "specific" as const,
-    };
-  }
-
-  // Default fallback to first active plan
-  return {
-    data: firstActivePlanQuery.data,
-    isLoading: firstActivePlanQuery.isLoading,
-    error: firstActivePlanQuery.error,
-    source: "fallback" as const,
-  };
 };

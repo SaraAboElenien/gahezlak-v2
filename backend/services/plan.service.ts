@@ -1,12 +1,42 @@
+import { FilterQuery } from "mongoose";
 import { errMsg } from "../common/err-messages";
 import { Errors } from "../errors";
 import { IPlan, Plans } from "../models/Plan";
 
+/**
+ * Is this the driver's duplicate-key error?
+ *
+ * Mongoose surfaces it as a `MongoServerError` with `code: 11000` rather than
+ * as anything typed, so the check is on the code. Narrowed by hand because
+ * importing the driver's error class here would tie the service to a
+ * dependency it otherwise never names.
+ */
+function isDuplicateKeyError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: number }).code === 11000
+  );
+}
+
 export async function createPlan(
   planData: Omit<IPlan, "_id" | "createdAt" | "updatedAt">,
 ) {
-  const plan = await Plans.create(planData);
-  return plan;
+  try {
+    const plan = await Plans.create(planData);
+    return plan;
+  } catch (err) {
+    // The unique (planGroup, frequency) index is what actually enforces "one
+    // monthly and one yearly per group" — `createPlanHandler`'s check-then-act
+    // cannot, since two concurrent creates both pass it. Left untranslated the
+    // collision reaches the global handler as an untyped driver error and
+    // becomes a 500, which reads to an admin as "the server is broken" rather
+    // than "that plan already exists".
+    if (isDuplicateKeyError(err)) {
+      throw new Errors.BadRequestError(errMsg.PLAN_ALREADY_EXISTS);
+    }
+    throw err;
+  }
 }
 
 export async function getPlanById(planId: string) {
@@ -17,8 +47,25 @@ export async function getPlanById(planId: string) {
   return plan;
 }
 
-export async function getAllPlans() {
-  const plans = await Plans.find().lean();
+/**
+ * Every plan on sale — and, for an administrator, optionally the retired ones.
+ *
+ * `GET /plans` is unauthenticated and served this list verbatim, so before the
+ * filter below "deactivate a plan" meant only "hide it in one of the two places
+ * the frontend asks": `plansApiService.getActivePlans()` filters client-side,
+ * `getPlans()` does not, and neither is a control. A retired plan was still
+ * quotable, still linkable and still subscribable.
+ *
+ * The filter defaults to the safe direction because the only caller today is
+ * that public route. `includeInactive` exists for the admin listing — there is
+ * no such endpoint yet, and building one needs a handler in
+ * `plans.controller.ts`; until then an administrator can still reach a
+ * deactivated plan by id (`getPlanById` is deliberately unfiltered, so
+ * `PATCH /plans/:id/activate` can always put one back on sale).
+ */
+export async function getAllPlans({ includeInactive = false } = {}) {
+  const filter: FilterQuery<IPlan> = includeInactive ? {} : { isActive: true };
+  const plans = await Plans.find(filter).lean();
   return plans;
 }
 

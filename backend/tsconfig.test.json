@@ -1,0 +1,27 @@
+// Type-checking config for the test suite.
+//
+// `tsconfig.json` is the BUILD config and deliberately excludes `tests` — that
+// exclusion is load-bearing, because without it `npm run build` emits compiled
+// test files into `dist/` and vitest then runs every test twice (a real bug,
+// fixed 2026-08-03). But "excluded from the build" had been conflated with
+// "excluded from checking": `npx tsc --noEmit`, the command CI runs as its
+// Typecheck step, therefore never read a single test file. They were not
+// type-checking cleanly, they were not being checked at all.
+//
+// So: same compiler options, `tests` included, and `noEmit` so this config can
+// never produce output no matter how it is invoked. `npm run typecheck` runs
+// both configs; do not point CI at only one of them.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["./**/*.ts", "./**/*.mts"],
+  // vitest.config.mts is excluded here for the same reason tsconfig.json
+  // excludes it: it is a native ES module that vite loads directly and tsc
+  // never compiles. Checked under the build config's "module": "commonjs" its
+  // `import.meta` is reported as an error that does not exist at runtime — a
+  // false failure in the command CI gates on. The `*.mts` glob above is kept so
+  // any future .mts test helper IS checked.
+  "exclude": ["node_modules", "dist", "vitest.config.mts"]
+}

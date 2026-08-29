@@ -296,6 +296,26 @@ describe("deleteMenuItem", () => {
     expect(await MenuItemModel.countDocuments({})).toBe(0);
   });
 
+  it("leaves the item's category exactly as it was", async () => {
+    const { deleteMenuItem } = await menuItemService();
+    const category = await seedCategory();
+    const item = await seedItem({ categoryId: category._id });
+
+    await deleteMenuItem(SHOP_A.toString(), item._id.toString());
+
+    // A category owns nothing — the link lives only on `MenuItem.categoryId`,
+    // so deleting the item is the whole of the cleanup. The service used to
+    // follow the delete with a `$pull` of the item out of a
+    // `Category.menuItems` array that `models/Category.ts` has never declared;
+    // it matched no document on any call and was removed as dead code. This
+    // asserts the invariant that made it dead, so that reintroducing a
+    // back-reference array shows up as a decision rather than a quiet second
+    // source of truth for the same relationship.
+    const stored = await CategoryModel.findById(category._id).lean();
+    expect(stored?.name).toEqual({ en: "Mains", ar: "أطباق رئيسية" });
+    expect(stored).not.toHaveProperty("menuItems");
+  });
+
   it("cannot delete another shop's item, and leaves it on their menu", async () => {
     const { deleteMenuItem } = await menuItemService();
     const foreign = await seedItem({ shopId: SHOP_B });
@@ -474,6 +494,7 @@ describe("updateMenuItem", () => {
     const unchanged = await getMenuItemById(
       SHOP_A.toString(),
       item._id.toString(),
+      "en",
     );
     expect(unchanged.discountPercentage).toBe(0);
   });

@@ -6,6 +6,11 @@ import {
 } from "../controllers/admin-analytics.controller";
 import { protect, isAllowed } from "../middlewares/auth";
 import { Role } from "../models/Role";
+import {
+  totalPlatformRevenueValidator,
+  revenueGrowthValidator,
+  topPerformingRestaurantsValidator,
+} from "../validators/admin-analytics.validator";
 
 const router = express.Router();
 
@@ -14,8 +19,20 @@ router.use(protect, isAllowed([Role.ADMIN]));
 
 // admin analysis routes
 
-router.get("/analytics/total-revenue", getTotalPlatformRevenueController);
-router.get("/analytics/revenue-growth", getRevenueGrowthController);
-router.get("/analytics/top-restaurants", getTopPerformingRestaurantsController);
+router.get(
+  "/analytics/total-revenue",
+  totalPlatformRevenueValidator,
+  getTotalPlatformRevenueController,
+);
+router.get(
+  "/analytics/revenue-growth",
+  revenueGrowthValidator,
+  getRevenueGrowthController,
+);
+router.get(
+  "/analytics/top-restaurants",
+  topPerformingRestaurantsValidator,
+  getTopPerformingRestaurantsController,
+);
 
 export default router;

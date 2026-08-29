@@ -1,6 +1,11 @@
 import { hash, compare } from "bcryptjs";
 import { SALT_ROUNDS } from "../config/bcrypt";
-import { IUser, Users } from "../models/User";
+import {
+  EMPTY_OTP_SLOT,
+  HIDDEN_USER_FIELDS,
+  IUser,
+  Users,
+} from "../models/User";
 import { sendEmail } from "../utils/send-email";
 import otpGenerator from "otp-generator";
 import jwt from "jsonwebtoken";
@@ -13,14 +18,12 @@ import {
 } from "../config/cookies";
 import { logger } from "../config/pino";
 
-// Fields that must never leave the server in an API response.
-const SENSITIVE_USER_FIELDS = [
-  "password",
-  "role",
-  "verificationCode",
-  "refreshToken",
-  "newEmail",
-] as const;
+// Fields that must never leave the server in an API response. `role` is
+// stripped here specifically — the login response carries the populated role
+// document, of which only the name is anyone's business — on top of the
+// project-wide list, which is where the OTP slots and `newEmail` are named so
+// that adding a slot updates every read path at once.
+const SENSITIVE_USER_FIELDS = [...HIDDEN_USER_FIELDS, "role"] as const;
 
 type SensitiveUserField = (typeof SENSITIVE_USER_FIELDS)[number];
 
@@ -137,12 +140,10 @@ export async function signUp(userData: {
   }
 
   // Generate verification code
-  const code = otpGenerator.generate(6, {
-    upperCaseAlphabets: false,
-    specialChars: false,
-  });
-  const expireAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes from now
-  const reason = "account_verification";
+  const verificationCode = await generateVerificationCode(
+    "account_verification",
+  );
+  const { code, reason } = verificationCode;
 
   const newUser = {
     firstName,
@@ -150,18 +151,14 @@ export async function signUp(userData: {
     email: email.toLowerCase(),
     password: hashedPassword,
     phoneNumber,
-    verificationCode: {
-      code,
-      expireAt,
-      reason,
-    },
+    verificationCode,
     role: userRole._id,
   };
 
   // Create user in database. The created document is intentionally not
-  // returned: the caller (signUpHandler) responds with an empty data object,
-  // and spreading a Mongoose document here never produced usable fields
-  // anyway (schema paths live on the prototype, not as own properties).
+  // returned: the caller responds with the delivery flag alone, and spreading
+  // a Mongoose document here never produced usable fields anyway (schema paths
+  // live on the prototype, not as own properties).
   await Users.create(newUser);
 
   // Send the verification email only after the user row exists.
@@ -175,10 +172,7 @@ export async function signUp(userData: {
   // The account is deliberately NOT rolled back when mail fails. The user is
   // recoverable — `resendVerificationCode` issues a fresh code — whereas
   // deleting the row would lose their password and force them to notice a
-  // failure they were never told about. What is still missing is telling *them*
-  // rather than only the log; that changes the signup response shape, so it is
-  // a product decision tracked in TECH_DEBT.md rather than something to slip in
-  // here.
+  // failure they were never told about.
   const verificationEmailSent = await sendEmail(
     email,
     "Your Verification Code",
@@ -192,15 +186,33 @@ export async function signUp(userData: {
         "exists and cannot be activated until the user requests a new code.",
     );
   }
+
+  // Reported to the caller, not only to the log. Telling someone to check an
+  // inbox that will never receive anything removes their reason to act: they
+  // wait, check spam, and conclude the product is broken, while the row sits
+  // unverified and blocks them from re-registering the same address.
+  //
+  // This is safe here and ONLY here. `resendVerificationCode` and
+  // `forgotPassword` must keep returning one response regardless of outcome,
+  // because mail is only sent for addresses that exist and branching on
+  // delivery would rebuild the account-enumeration oracle closed on
+  // 2026-08-05. `signUp` already rejects a duplicate address, so it discloses
+  // existence anyway and this flag leaks nothing new.
+  return { verificationEmailSent };
 }
 
 /**
- * The only OTP reason this endpoint will honour. Both flows write to the same
- * single `verificationCode` slot on the user, so without this check a
- * password_reset code satisfied every remaining test here and was exchanged for
- * a full session — a reset code became a login credential, and the reset flow
- * doubled as an email-verification bypass for someone who never set a password.
- * A reset code authorises `resetPassword` and nothing else.
+ * The only OTP reason this endpoint will honour.
+ *
+ * Historically all three flows wrote to one shared `verificationCode` slot, so
+ * without this check a password_reset code satisfied every remaining test here
+ * and was exchanged for a full session — a reset code became a login
+ * credential, and the reset flow doubled as an email-verification bypass for
+ * someone who never set a password. Reset codes now live in their own slot and
+ * this endpoint cannot read them at all, so the check is belt-and-braces
+ * rather than the sole barrier. It stays: it is also what rejects a caller
+ * that simply asks for the wrong reason, and cheap defence in depth on an
+ * unauthenticated endpoint that mints sessions is worth keeping.
  */
 const VERIFIABLE_REASON = "account_verification";
 
@@ -218,7 +230,7 @@ export async function verifyCode(verificationData: {
   const user = await findUserByEmail(verificationData.email);
 
   const vCode = user.verificationCode;
-  if (!vCode.code || !vCode.expireAt || !vCode.reason) {
+  if (!vCode?.code || !vCode.expireAt || !vCode.reason) {
     throw new Errors.BadRequestError(errMsg.NO_VERIFICATION_CODE_FOUND);
   }
   if (vCode.code !== code) {
@@ -237,7 +249,7 @@ export async function verifyCode(verificationData: {
   await Users.findByIdAndUpdate(user._id, {
     $set: {
       isVerified: true,
-      verificationCode: { code: null, expireAt: null, reason: null },
+      verificationCode: EMPTY_OTP_SLOT,
       refreshToken,
     },
   });
@@ -365,10 +377,12 @@ export async function forgotPassword(userData: { email: string }) {
     return genericResponse;
   }
 
-  const verificationCode = await generateVerificationCode("password_reset");
+  const passwordResetCode = await generateVerificationCode("password_reset");
 
+  // Its own slot, so issuing a reset no longer wipes an account-verification
+  // or email-change code the same person is holding (see models/User.ts).
   await Users.findByIdAndUpdate(user._id, {
-    $set: { verificationCode },
+    $set: { passwordResetCode },
   });
 
   // Same enumeration constraint as resendVerificationCode above: the response
@@ -377,7 +391,7 @@ export async function forgotPassword(userData: { email: string }) {
   const resetEmailSent = await sendEmail(
     user.email,
     "Your Password Reset Code",
-    `Your password reset code is: <b>${verificationCode.code}</b>. It will expire in 10 minutes.`,
+    `Your password reset code is: <b>${passwordResetCode.code}</b>. It will expire in 10 minutes.`,
   );
 
   if (!resetEmailSent) {
@@ -406,13 +420,14 @@ export async function resetPassword(resetData: {
     throw new Errors.BadRequestError(errMsg.NO_VERIFICATION_CODE_FOUND);
   }
 
-  const vCode = user.verificationCode;
-  if (!vCode.code || !vCode.expireAt || !vCode.reason) {
+  const vCode = user.passwordResetCode;
+  if (!vCode?.code || !vCode.expireAt || !vCode.reason) {
     throw new Errors.BadRequestError(errMsg.NO_VERIFICATION_CODE_FOUND);
   }
   if (vCode.code !== code) {
     throw new Errors.BadRequestError(errMsg.INVALID_VERIFICATION_CODE);
   }
+  // Retained even though the slot now identifies the flow — see models/User.ts.
   if (vCode.reason !== "password_reset") {
     throw new Errors.BadRequestError(errMsg.INVALID_VERIFICATION_REASON);
   }
@@ -425,7 +440,7 @@ export async function resetPassword(resetData: {
   await Users.findByIdAndUpdate(user._id, {
     $set: {
       password: hashedPassword,
-      verificationCode: { code: null, expireAt: null, reason: null },
+      passwordResetCode: EMPTY_OTP_SLOT,
       refreshToken: "",
     },
   });

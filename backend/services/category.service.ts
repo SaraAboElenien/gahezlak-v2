@@ -2,7 +2,7 @@ import { ICategory, CategoryModel } from "../models/Category";
 import { MenuItemModel } from "../models/MenuItem";
 import { Errors } from "../errors";
 import { errMsg } from "../common/err-messages";
-import mongoose, { FilterQuery } from "mongoose";
+import mongoose, { FilterQuery, UpdateQuery } from "mongoose";
 import { LangType } from "../common/types/general-types";
 import { Shops } from "../models/Shop";
 
@@ -49,17 +49,42 @@ const UPDATABLE_CATEGORY_FIELDS = [
   "description",
 ] as const satisfies readonly (keyof ICategory)[];
 
+/**
+ * Both updatable fields are bilingual `{ en, ar }` pairs, and both are
+ * flattened onto dotted paths (`name.en`, `description.ar`) rather than passed
+ * through whole.
+ *
+ * Mongoose *replaces* a nested object in an update instead of merging it, so
+ * `{ name: { en: "Beverages" } }` did not rename the English heading — it
+ * deleted the Arabic one. `updateCategoryValidator` marks each language
+ * `.optional()`, so a one-language body is valid input and has to mean "change
+ * this language", and `findOneAndUpdate` runs no validators here, so the write
+ * left the document violating its own `name.ar: { required: true }` schema with
+ * no error anywhere. The Arabic public menu then rendered an empty heading over
+ * a section of the menu.
+ *
+ * Sending both languages still replaces both, so a deliberate rename is
+ * unaffected — dotted paths only narrow *which* keys the update touches.
+ */
 function pickUpdatableCategoryFields(
   updateData: Partial<ICategory>,
-): Partial<ICategory> {
-  const updates: Partial<ICategory> = {};
+): UpdateQuery<ICategory> {
+  const updates: Record<string, unknown> = {};
   for (const field of UPDATABLE_CATEGORY_FIELDS) {
     const value = updateData[field];
-    if (value !== undefined) {
-      // TypeScript cannot correlate the key with its value type while `field`
-      // ranges over a union of keys, so it widens the target to `never`. The
-      // assignment is sound — the same `field` indexes both objects.
-      (updates as Record<string, unknown>)[field] = value;
+    if (value === undefined) continue;
+
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      // Not an `{ en, ar }` pair at all — the validator only checks `name.en`
+      // and `name.ar`, so a body sending `name: "Drinks"` reaches here. Passed
+      // through untouched so Mongoose rejects it, rather than being spread
+      // character-by-character into `name.0`, `name.1`, … and quietly stored.
+      updates[field] = value;
+      continue;
+    }
+
+    for (const [lang, text] of Object.entries(value)) {
+      if (text !== undefined) updates[`${field}.${lang}`] = text;
     }
   }
   return updates;
@@ -100,9 +125,38 @@ export async function updateCategory(
   return category;
 }
 
+/**
+ * Deletes a category, but only while it is empty.
+ *
+ * The old cleanup step read `MenuItemModel.updateMany({ category: categoryId },
+ * { category: null, isAvailable: false })`. The schema path is `categoryId`, so
+ * that filter matched nothing on every call this service has ever made and the
+ * items were simply left pointing at a category that no longer existed. Fixing
+ * the field name alone would have been the wrong repair, because it would have
+ * turned a no-op into a destructive one: `categoryId` is `required: true`, so
+ * `null` is not a state the schema permits, and `isAvailable: false` would have
+ * pulled every dish in the section off the public menu with no way for the
+ * owner to find them again (the dashboard groups by category, and their
+ * category is gone).
+ *
+ * Of the three possible behaviours — orphan the items, reassign them to a
+ * default "Uncategorised" category, or refuse while the category is non-empty —
+ * only refusing cannot silently destroy or hide a shop's menu. Orphaning writes
+ * a schema-invalid document; reassigning invents a category the owner never
+ * created and still moves their menu around behind their back. Refusing costs
+ * the owner one extra step and is the only one that is reversible by doing
+ * nothing. This codebase's recurring failure mode is safeguards that fail open,
+ * so the deletion fails closed.
+ */
 export async function deleteCategory(shopId: string, categoryId: string) {
-  const category = await CategoryModel.findOneAndDelete({
-    _id: new mongoose.Types.ObjectId(categoryId),
+  const categoryObjectId = new mongoose.Types.ObjectId(categoryId);
+
+  // Ownership is resolved before emptiness so that a category belonging to
+  // another shop reports CATEGORY_NOT_FOUND rather than CATEGORY_NOT_EMPTY —
+  // the second answer would confirm both that the id exists and that it has
+  // items on it, to a caller with no right to know either.
+  const category = await CategoryModel.findOne({
+    _id: categoryObjectId,
     shopId,
   });
 
@@ -110,10 +164,21 @@ export async function deleteCategory(shopId: string, categoryId: string) {
     throw new Errors.NotFoundError(errMsg.CATEGORY_NOT_FOUND);
   }
 
-  await MenuItemModel.updateMany(
-    { category: categoryId },
-    { category: null, isAvailable: false },
-  );
+  // Scoped to the caller's own shop, not to `categoryId` alone: `updateMenuItem`
+  // lets an item's `categoryId` be set without checking the new category
+  // belongs to the same shop, so a foreign item can point here. Counting those
+  // too would let one shop permanently block another's deletion with an error
+  // the victim has no way to act on.
+  const itemsInCategory = await MenuItemModel.countDocuments({
+    shopId: new mongoose.Types.ObjectId(shopId),
+    categoryId: categoryObjectId,
+  });
+
+  if (itemsInCategory > 0) {
+    throw new Errors.BadRequestError(errMsg.CATEGORY_NOT_EMPTY);
+  }
+
+  await CategoryModel.deleteOne({ _id: categoryObjectId, shopId });
 
   return category;
 }

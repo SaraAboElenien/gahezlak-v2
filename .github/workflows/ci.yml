@@ -76,8 +76,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # `npm run typecheck`, not `npx tsc --noEmit`. The bare command reads
+      # tsconfig.json, which excludes `tests` so the build cannot emit compiled
+      # tests into dist/ — with the side effect that the entire test suite, the
+      # thing asserting the rest of the code is correct, was never type-checked
+      # at all. The script runs the build config AND tsconfig.test.json.
       - name: Typecheck
-        run: npx tsc --noEmit
+        run: npm run typecheck
 
       - name: Lint
         run: npx eslint .

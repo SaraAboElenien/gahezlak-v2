@@ -72,6 +72,11 @@ enum errorMessage {
   TOO_MANY_OTP_ATTEMPTS = "TOO_MANY_OTP_ATTEMPTS",
   SHOP_NOT_ACCEPTING_ORDERS = "SHOP_NOT_ACCEPTING_ORDERS",
   SHOP_SELECTOR_REQUIRED = "SHOP_SELECTOR_REQUIRED",
+  CATEGORY_NOT_EMPTY = "CATEGORY_NOT_EMPTY",
+  ROLE_IN_USE = "ROLE_IN_USE",
+  ROLE_NAME_RESERVED = "ROLE_NAME_RESERVED",
+  PLAN_INACTIVE = "PLAN_INACTIVE",
+  PLAN_ALREADY_EXISTS = "PLAN_ALREADY_EXISTS",
 }
 
 export const errMsg: {
@@ -349,5 +354,25 @@ export const errMsg: {
   SHOP_SELECTOR_REQUIRED: {
     en: "A shop id or shop name is required.",
     ar: "معرف المتجر أو اسمه مطلوب.",
+  },
+  CATEGORY_NOT_EMPTY: {
+    en: "This category still contains menu items. Move or delete them first.",
+    ar: "هذا التصنيف ما زال يحتوي على أصناف. يرجى نقلها أو حذفها أولاً.",
+  },
+  ROLE_IN_USE: {
+    en: "This role is assigned to one or more users and cannot be deleted.",
+    ar: "هذا الدور مُسند إلى مستخدم واحد أو أكثر ولا يمكن حذفه.",
+  },
+  ROLE_NAME_RESERVED: {
+    en: "This role name is reserved and cannot be used.",
+    ar: "اسم الدور هذا محجوز ولا يمكن استخدامه.",
+  },
+  PLAN_INACTIVE: {
+    en: "This plan is no longer available.",
+    ar: "هذه الخطة لم تعد متاحة.",
+  },
+  PLAN_ALREADY_EXISTS: {
+    en: "A plan with this group and frequency already exists.",
+    ar: "توجد بالفعل خطة بنفس المجموعة والتكرار.",
   },
 };

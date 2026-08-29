@@ -13,7 +13,7 @@ import {
 } from "../common/types/controller-response.types";
 import { IMenuItem } from "../models/MenuItem";
 import { uploadImage } from "../utils/upload-image";
-import { requireUser } from "../utils/current-user";
+import { requireShopId } from "../utils/current-user";
 
 export const createMenuItemAndAddToCategoryHandler: RequestHandler<
   unknown,
@@ -30,7 +30,7 @@ export const createMenuItemAndAddToCategoryHandler: RequestHandler<
     | "isAvailable"
   >
 > = async (req, res) => {
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   let imageUrl: string | undefined;
 
   if (req.file) {
@@ -56,7 +56,7 @@ export const getMenuItemByIdHandler: RequestHandler<
   { lang: "en" | "ar" }
 > = async (req, res) => {
   const itemId = req.params.itemId;
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
 
   const item = await getMenuItemById(shopId, itemId, req.lang);
 
@@ -72,7 +72,7 @@ export const deleteMenuItemHandler: RequestHandler<
   unknown
 > = async (req, res) => {
   const itemId = req.params.itemId;
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const deleted = await deleteMenuItem(shopId, itemId);
 
   res.status(200).json({
@@ -87,7 +87,7 @@ export const toggleItemAvailabilityHandler: RequestHandler<
   { isAvailable: boolean }
 > = async (req, res) => {
   const { itemId } = req.params;
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const { isAvailable } = req.body;
   const item = await toggleItemAvailability(shopId, itemId, isAvailable);
 
@@ -105,7 +105,7 @@ export const updateMenuItemHandler: RequestHandler<
   Partial<IMenuItem>
 > = async (req, res) => {
   const { itemId } = req.params;
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   let imageUrl: string | undefined;
 
   if (req.file) {

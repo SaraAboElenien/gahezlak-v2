@@ -23,7 +23,7 @@ import mongoose, { FilterQuery } from "mongoose";
 import { createPaymentIntent, refundTransaction } from "../utils/paymob";
 import { PaymentMethods } from "../models/Payment";
 import { logger } from "../config/pino";
-import { requireUser } from "../utils/current-user";
+import { requireShopId } from "../utils/current-user";
 import { assertShopHasActiveSubscription } from "../middlewares/subscription-check.middleware";
 import { Orders } from "../models/Order";
 //import { io } from "../sockets/socketServer";
@@ -189,7 +189,7 @@ export const createOrderHandler: RequestHandler<
 };
 
 export const updateOrderStatusHandler: RequestHandler = async (req, res) => {
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const { orderId } = req.params;
   const { status } = req.body;
 
@@ -237,7 +237,7 @@ export const getOrdersByShopHandler: RequestHandler<
   unknown,
   { page?: string; limit?: string }
 > = async (req, res) => {
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const page = parseInt(req.query.page as string) || 1;
   const limit = parseInt(req.query.limit as string) || 10;
   const skip = (page - 1) * limit;
@@ -268,7 +268,7 @@ export const getOrdersByShopHandler: RequestHandler<
 
 export const getOrderByIdHandler: RequestHandler = async (req, res) => {
   const orderId = req.params.orderId;
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const order = await GetOrderById(orderId, shopId);
 
   const response: SuccessResponse<typeof order> = {

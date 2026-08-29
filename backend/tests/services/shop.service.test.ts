@@ -908,7 +908,13 @@ describe("registerShopMember", () => {
     expect(await Users.countDocuments({})).toBe(0);
   });
 
-  it("rejects a duplicate email with a raw index error and leaves the roster intact", async () => {
+  /**
+   * Adding a staff member who already has an account is an ordinary mistake.
+   * It used to surface as a raw MongoServerError (code 11000) from the unique
+   * index on `Users.email`, which the global handler flattens to a bare 500 —
+   * so a routine slip read to the owner as "the system is broken".
+   */
+  it("rejects a duplicate email with a 400 naming the collision, not a raw index error", async () => {
     const { registerShopMember } = await shopService();
     const shop = await seedShop();
     await registerShopMember(shop._id.toString(), memberData(staffRoleId));
@@ -917,15 +923,85 @@ describe("registerShopMember", () => {
       registerShopMember(shop._id.toString(), memberData(managerRoleId)),
     );
 
-    // CURRENT BEHAVIOUR, not desired behaviour: nothing checks for an existing
-    // account first, so this surfaces as a MongoServerError (code 11000) and a
-    // 500 rather than the MEMBER_ALREADY_EXISTS / EMAIL_ALREADY_IN_USE message
-    // that already exists in err-messages.ts and is used nowhere. What matters
-    // more is what it does *not* do: the failure lands on the user insert,
-    // before `shop.save()`, so the roster is untouched. Reported; do not "fix"
-    // by changing this assertion.
-    expect(err.code).toBe(11000);
+    expect(err.code).toBeUndefined();
+    expect(err).toMatchObject({ statusCode: 400 });
+    // Already on *this* roster, so this is the message that needs no action.
+    expect(err.message).toContain("already a member of this shop");
     expect((await Shops.findById(shop._id).lean())?.members).toHaveLength(1);
+  });
+
+  /**
+   * The other half of the same guard, and the reason both messages exist: an
+   * address belonging to an account somewhere else on the platform is a
+   * different situation from one already on this roster, and it calls for a
+   * different action (use a different address, rather than do nothing).
+   */
+  it("distinguishes an email belonging to an account outside this shop", async () => {
+    const { registerShopMember } = await shopService();
+    const shop = await seedShop();
+    const outsider = await seedUser();
+
+    const err = await captureError(
+      registerShopMember(
+        shop._id.toString(),
+        memberData(staffRoleId, outsider.email),
+      ),
+    );
+
+    expect(err).toMatchObject({ statusCode: 400 });
+    expect(err.message).toContain("already in use");
+    expect((await Shops.findById(shop._id).lean())?.members).toHaveLength(0);
+  });
+
+  it("matches an existing address case-insensitively", async () => {
+    const { registerShopMember } = await shopService();
+    const shop = await seedShop();
+    await registerShopMember(shop._id.toString(), memberData(staffRoleId));
+
+    // Stored lower-cased; a differently-cased retry must still be caught here
+    // rather than by the index, or the friendly message is decorative.
+    const err = await captureError(
+      registerShopMember(
+        shop._id.toString(),
+        memberData(staffRoleId, "New.Member@EXAMPLE.com"),
+      ),
+    );
+
+    expect(err.code).toBeUndefined();
+    expect(err).toMatchObject({ statusCode: 400 });
+  });
+
+  /**
+   * TRANSACTIONALITY. The account and the roster entry are two writes, and a
+   * failure between them used to leave a fully functional, already-verified
+   * user account that the shop does not list and nothing ever cleans up —
+   * invisible on the members page, but able to log in, carrying a `shop` link
+   * that scopes its access token.
+   *
+   * Forced by making the *second* write fail, which is the only ordering that
+   * can produce the orphan. The assertion is on the database, not the thrown
+   * error: a rollback that does not roll back still throws.
+   */
+  it("leaves no orphaned account behind when adding to the roster fails", async () => {
+    const { registerShopMember } = await shopService();
+    const shop = await seedShop();
+
+    const updateOne = vi
+      .spyOn(Shops, "updateOne")
+      .mockImplementationOnce(() => {
+        throw new Error("roster write failed");
+      });
+
+    await expect(
+      registerShopMember(shop._id.toString(), memberData(staffRoleId)),
+    ).rejects.toThrow("roster write failed");
+
+    updateOne.mockRestore();
+
+    await expect(
+      Users.countDocuments({ email: "new.member@example.com" }),
+    ).resolves.toBe(0);
+    expect((await Shops.findById(shop._id).lean())?.members).toHaveLength(0);
   });
 });
 

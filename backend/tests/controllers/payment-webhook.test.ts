@@ -143,6 +143,83 @@ async function createOrder(paymentMethod: string, orderNumber: number) {
   });
 }
 
+/**
+ * A shop with a PENDING subscription on a plan — the state
+ * `handleTransactionProcessed` expects to find when Paymob reports the first
+ * transaction. `trialPeriodDays` is the axis that decides whether that
+ * transaction was money or merely an authorisation.
+ */
+async function seedPendingSubscription(opts: {
+  price: number;
+  trialPeriodDays: number;
+}) {
+  const { Plans } = await import("../../models/Plan");
+  const { Shops } = await import("../../models/Shop");
+  const { Subscriptions, SubscriptionStatus } =
+    await import("../../models/Subscription");
+
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const plan = await Plans.create({
+    planGroup: "Starter",
+    title: `Ledger plan ${suffix}`,
+    description: "Test plan",
+    frequency: "monthly",
+    currency: "EGP",
+    price: opts.price,
+    paymobPlanId: Math.floor(Math.random() * 1_000_000),
+    features: ["QR menu"],
+    trialPeriodDays: opts.trialPeriodDays,
+    isActive: true,
+  });
+
+  const shop = await Shops.create({
+    name: `Ledger Shop ${suffix}`,
+    type: "restaurant",
+    address: { country: "EG", city: "Cairo", street: "1 Main St" },
+    phoneNumber: "01000000000",
+    email: `ledger-${suffix}@example.com`,
+    ownerId: new mongoose.Types.ObjectId(),
+  });
+
+  await Subscriptions.create({
+    userId: new mongoose.Types.ObjectId(),
+    shop: shop._id,
+    plan: plan._id,
+    status: SubscriptionStatus.PENDING,
+    currentPeriodStart: new Date("2026-08-01"),
+    currentPeriodEnd: new Date("2026-08-29"),
+  });
+
+  return { shopId: shop._id, planId: plan._id };
+}
+
+/**
+ * The `type: "TRANSACTION"` subscription webhook. `subscription_plan_id` must
+ * be present or `handleTransactionProcessed` returns before doing anything,
+ * and `extra` carries the ids it reconciles on.
+ */
+function buildSubscriptionTransactionReq(opts: {
+  shopId: mongoose.Types.ObjectId;
+  planId: mongoose.Types.ObjectId;
+  transactionId: number;
+}): Request {
+  const obj = buildPaidTransaction("unused", {
+    id: opts.transactionId,
+    payment_key_claims: {
+      subscription_plan_id: 4242,
+      extra: {
+        shopId: opts.shopId.toString(),
+        planId: opts.planId.toString(),
+      },
+    },
+  });
+
+  return {
+    body: { type: "TRANSACTION", obj },
+    query: { hmac: signTransaction(obj) },
+  } as unknown as Request;
+}
+
 beforeAll(async () => {
   await connectTestDB();
 });
@@ -418,5 +495,161 @@ describe("handlePaymobSubscriptionWebhook trigger routing", () => {
 
     const untouched = await Subscriptions.findById(subscription._id);
     expect(untouched?.status).toBe(SubscriptionStatus.ACTIVE);
+  });
+});
+
+/**
+ * The settled-transaction ledger (ADR-018).
+ *
+ * These assert the ledger rows the money webhooks are supposed to append,
+ * because the revenue figure the platform owner reads is now derived entirely
+ * from them. A missing row is not a crash: it is a smaller number, reported
+ * confidently, which is the failure mode this whole collection exists to end.
+ */
+describe("payment ledger", () => {
+  it("records an order payment, priced from the order rather than the payload", async () => {
+    const { handlePaymobOrdersWebhook } =
+      await import("../../controllers/payment.webhook.controller");
+    const { PaymentTransactions, PaymentTransactionKind } =
+      await import("../../models/PaymentTransaction");
+
+    const order = await createOrder("CreditCard", 100101);
+    const obj = buildPaidTransaction(order._id.toString());
+
+    await handlePaymobOrdersWebhook(
+      {
+        body: { obj },
+        query: { hmac: signTransaction(obj) },
+      } as unknown as Request,
+      mockResponse(),
+      vi.fn(),
+    );
+
+    const rows = await PaymentTransactions.find({});
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe(PaymentTransactionKind.ORDER);
+    expect(rows[0].orderId?.toString()).toBe(order._id.toString());
+    expect(rows[0].shopId.toString()).toBe(order.shopId.toString());
+    // The amount comes from the order the server priced, never from anything
+    // the client could influence.
+    expect(rows[0].amount).toBe(150);
+    expect(rows[0].currency).toBe("EGP");
+  });
+
+  it("writes no ledger row when the HMAC is invalid", async () => {
+    const { handlePaymobOrdersWebhook } =
+      await import("../../controllers/payment.webhook.controller");
+    const { PaymentTransactions } =
+      await import("../../models/PaymentTransaction");
+
+    const order = await createOrder("CreditCard", 100102);
+    const obj = buildPaidTransaction(order._id.toString());
+
+    // The handler throws rather than calling next(), so the rejection is
+    // part of the contract being asserted here.
+    await expect(
+      handlePaymobOrdersWebhook(
+        { body: { obj }, query: { hmac: "forged" } } as unknown as Request,
+        mockResponse(),
+        vi.fn(),
+      ),
+    ).rejects.toThrow();
+
+    expect(await PaymentTransactions.countDocuments()).toBe(0);
+  });
+
+  it("does not double-count a redelivered order webhook", async () => {
+    // Paymob retries anything it did not get a 200 for. Two identical
+    // deliveries must leave one row, or platform reporting drifts upward
+    // every time the network hiccups.
+    const { handlePaymobOrdersWebhook } =
+      await import("../../controllers/payment.webhook.controller");
+    const { PaymentTransactions } =
+      await import("../../models/PaymentTransaction");
+
+    const order = await createOrder("CreditCard", 100103);
+    const obj = buildPaidTransaction(order._id.toString());
+    const req = {
+      body: { obj },
+      query: { hmac: signTransaction(obj) },
+    } as unknown as Request;
+
+    await handlePaymobOrdersWebhook(req, mockResponse(), vi.fn());
+    await handlePaymobOrdersWebhook(req, mockResponse(), vi.fn());
+
+    expect(await PaymentTransactions.countDocuments()).toBe(1);
+  });
+
+  it("records a paid subscription signup when the plan has NO trial", async () => {
+    const { handlePaymobSubscriptionWebhook } =
+      await import("../../controllers/payment.webhook.controller");
+    const { PaymentTransactions, PaymentTransactionKind } =
+      await import("../../models/PaymentTransaction");
+
+    const { shopId, planId } = await seedPendingSubscription({
+      price: 299,
+      trialPeriodDays: 0,
+    });
+
+    await handlePaymobSubscriptionWebhook(
+      buildSubscriptionTransactionReq({
+        shopId,
+        planId,
+        transactionId: 700301,
+      }),
+      mockResponse(),
+      vi.fn(),
+    );
+
+    const rows = await PaymentTransactions.find({});
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe(PaymentTransactionKind.SUBSCRIPTION_INITIAL);
+    expect(rows[0].amount).toBe(299);
+    expect(rows[0].paymobTransactionId).toBe(700301);
+  });
+
+  /**
+   * THE ONE THAT MATTERS MOST.
+   *
+   * A plan with a trial runs its first transaction through Paymob's
+   * *verification* integration, which authorises and then auto-voids. No money
+   * is captured — but the authorisation is real enough to produce a webhook
+   * that looks exactly like a successful payment. Recording it would book full
+   * price for every free trial the platform ever grants, and the resulting
+   * revenue figure would look entirely plausible.
+   *
+   * This project has already shipped the inverse of this bug once: trial
+   * signups were charged the full amount on day one because the card
+   * integration was used where the verification one belonged.
+   */
+  it("records NOTHING for a trial signup, because the charge is authorised and voided", async () => {
+    const { handlePaymobSubscriptionWebhook } =
+      await import("../../controllers/payment.webhook.controller");
+    const { PaymentTransactions } =
+      await import("../../models/PaymentTransaction");
+    const { Subscriptions, SubscriptionStatus } =
+      await import("../../models/Subscription");
+
+    const { shopId, planId } = await seedPendingSubscription({
+      price: 299,
+      trialPeriodDays: 14,
+    });
+
+    await handlePaymobSubscriptionWebhook(
+      buildSubscriptionTransactionReq({
+        shopId,
+        planId,
+        transactionId: 700302,
+      }),
+      mockResponse(),
+      vi.fn(),
+    );
+
+    // The subscription must still activate — this is a skip of the ledger
+    // write only, not of the whole handler.
+    const subscription = await Subscriptions.findOne({ shop: shopId });
+    expect(subscription?.status).toBe(SubscriptionStatus.TRIALING);
+
+    expect(await PaymentTransactions.countDocuments()).toBe(0);
   });
 });

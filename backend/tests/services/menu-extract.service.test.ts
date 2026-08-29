@@ -232,7 +232,7 @@ describe("extractMenuFromFile — failure reporting", () => {
 
 describe("extractMenuFromFile — provider errors are translated, not leaked", () => {
   /** Builds a real SDK APIError, the way the client constructs one. */
-  async function apiError(status: number, body: unknown) {
+  async function apiError(status: number, body: object) {
     const Anthropic = (await import("@anthropic-ai/sdk")).default;
     return Anthropic.APIError.generate(status, body, "error", new Headers());
   }

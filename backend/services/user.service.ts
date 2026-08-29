@@ -1,5 +1,10 @@
 import { FilterQuery } from "mongoose";
-import { IUser, Users } from "../models/User";
+import {
+  EMPTY_OTP_SLOT,
+  HIDDEN_USER_PROJECTION,
+  IUser,
+  Users,
+} from "../models/User";
 import { sendEmail } from "../utils/send-email";
 import otpGenerator from "otp-generator";
 import { Errors } from "../errors";
@@ -25,10 +30,21 @@ export async function requestEmailChange(userId: string, newEmail: string) {
     specialChars: false,
   });
   const expireAt = new Date(Date.now() + 10 * 60 * 1000);
-  user.verificationCode = { code, expireAt, reason: "email_change" };
-  user.newEmail = newEmail.toLowerCase();
-  await user.save();
 
+  // Send BEFORE persisting, deliberately.
+  //
+  // The order used to be the other way round, and the failure path threw after
+  // the write had already landed: a relay outage left the account carrying a
+  // pending `newEmail` and a live OTP that the person never asked to confirm,
+  // could not see, and had no way to clear — the profile then advertised a
+  // change to an address they may never have wanted. Nothing in the app
+  // cancels a pending change.
+  //
+  // The code is generated in memory, so nothing has to exist in the database
+  // for the mail to be correct. Sending first inverts the residue: if the save
+  // fails after a successful send, the user holds a code that simply does not
+  // work and retries — which is the recoverable direction, and the one the
+  // person can act on.
   const checkEmail = await sendEmail(
     newEmail,
     "Email Change Confirmation",
@@ -37,6 +53,12 @@ export async function requestEmailChange(userId: string, newEmail: string) {
   if (!checkEmail) {
     throw new Errors.BadRequestError(errMsg.FAILED_TO_SEND_EMAIL);
   }
+
+  // Its own slot (see models/User.ts): requesting an email change no longer
+  // wipes a password-reset or account-verification code that is in flight.
+  user.emailChangeCode = { code, expireAt, reason: "email_change" };
+  user.newEmail = newEmail.toLowerCase();
+  await user.save();
 
   return { message: "A confirmation code has been sent to your new email." };
 }
@@ -47,14 +69,15 @@ export async function confirmEmailChange(userId: string, code: string) {
     throw new Errors.NotFoundError(errMsg.USER_NOT_FOUND);
   }
 
-  const vCode = user.verificationCode;
+  const vCode = user.emailChangeCode;
   const newEmail = user.newEmail;
-  if (!vCode.code || !vCode.expireAt || !vCode.reason || !newEmail) {
+  if (!vCode?.code || !vCode.expireAt || !vCode.reason || !newEmail) {
     throw new Errors.BadRequestError(errMsg.NO_EMAIL_CHANGE_REQUEST_FOUND);
   }
   if (vCode.code !== code) {
     throw new Errors.BadRequestError(errMsg.INVALID_CONFIRMATION_CODE);
   }
+  // Retained even though the slot now identifies the flow — see models/User.ts.
   if (vCode.reason !== "email_change") {
     throw new Errors.BadRequestError(errMsg.INVALID_CONFIRMATION_REASON);
   }
@@ -83,7 +106,7 @@ export async function confirmEmailChange(userId: string, code: string) {
 
   user.email = newEmail;
   user.newEmail = undefined;
-  user.verificationCode = { code: null, expireAt: null, reason: null };
+  user.emailChangeCode = { ...EMPTY_OTP_SLOT };
   await user.save();
 
   return {
@@ -125,7 +148,7 @@ export async function getUserProfile(userId: string) {
       },
     })
     .populate("role", "name")
-    .select("-password -refreshToken -verificationCode -newEmail");
+    .select(HIDDEN_USER_PROJECTION);
 
   if (!user) {
     throw new Errors.NotFoundError(errMsg.USER_NOT_FOUND);
@@ -193,7 +216,7 @@ export async function getAllUsers(
   const users = await Users.find(query)
     .populate("role", "name")
     .populate("shop", "name  address phoneNumber email ownerId subscriptionId")
-    .select("-password -refreshToken -verificationCode")
+    .select(HIDDEN_USER_PROJECTION)
     .skip(skip)
     .limit(limit)
     .sort({ createdAt: -1 });
@@ -216,7 +239,7 @@ export async function getUserByIdAdmin(userId: string) {
   const user = await Users.findById(userId)
     .populate("role", "name")
     .populate("shop", "name  address phoneNumber email ownerId subscriptionId")
-    .select("-password -refreshToken -verificationCode");
+    .select(HIDDEN_USER_PROJECTION);
 
   if (!user) {
     throw new Errors.NotFoundError(errMsg.USER_NOT_FOUND);

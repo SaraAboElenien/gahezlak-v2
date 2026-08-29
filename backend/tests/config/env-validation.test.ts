@@ -40,7 +40,8 @@ describe("config/env-validation", () => {
     warn.mockRestore();
   });
 
-  const warnings = () => warn.mock.calls.map((c) => String(c[0])).join("\n");
+  const warnings = () =>
+    warn.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
 
   it("warns, naming the variable, when ORDER_WEBHOOK_URL is unset", async () => {
     delete process.env.ORDER_WEBHOOK_URL;
@@ -96,5 +97,68 @@ describe("config/env-validation", () => {
     await expect(import("../../config/env-validation")).rejects.toThrow(
       /JWT_SECRET/,
     );
+  });
+
+  /**
+   * The email credentials are readable under two names. `SMTP_USER` /
+   * `SMTP_PASSWORD` are the real ones; `sendEmail` / `emailPassword` are the
+   * originals, still honoured because they are what is set in the live Render
+   * dashboard — renaming in code alone would have broken production mail on
+   * deploy.
+   *
+   * That fallback creates a trap this block exists to close: a check written
+   * against only the new names prints "Email is not configured" at every boot
+   * while mail works perfectly. A false alarm in a boot warning is worse than
+   * no warning, because the next real one gets ignored too.
+   */
+  const EMAIL_VARS = [
+    "SMTP_USER",
+    "SMTP_PASSWORD",
+    "sendEmail",
+    "emailPassword",
+  ] as const;
+
+  function clearEmailVars() {
+    for (const k of EMAIL_VARS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+  }
+
+  it("stays silent about email when only the CURRENT names are set", async () => {
+    clearEmailVars();
+    process.env.SMTP_USER = "relay-user";
+    process.env.SMTP_PASSWORD = "relay-secret";
+
+    await import("../../config/env-validation");
+
+    expect(warnings()).not.toMatch(/Email is not configured/);
+  });
+
+  it("stays silent about email when only the LEGACY names are set", async () => {
+    // The live production state today. This is the case that would have
+    // regressed into a permanent false warning.
+    clearEmailVars();
+    process.env.sendEmail = "relay-user";
+    process.env.emailPassword = "relay-secret";
+
+    await import("../../config/env-validation");
+
+    expect(warnings()).not.toMatch(/Email is not configured/);
+  });
+
+  it("warns naming the CURRENT variable when a credential is missing under both names", async () => {
+    clearEmailVars();
+    // The password is present under the legacy name; the user is absent
+    // entirely, so exactly one credential is genuinely missing.
+    process.env.emailPassword = "relay-secret";
+
+    await import("../../config/env-validation");
+
+    const text = warnings();
+    expect(text).toMatch(/Email is not configured/);
+    // Names the credential an operator should now set, not the deprecated one.
+    expect(text).toContain("SMTP_USER");
+    expect(text).not.toContain("SMTP_PASSWORD");
   });
 });

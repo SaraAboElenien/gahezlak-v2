@@ -6,10 +6,10 @@ import {
   BestAndWorstSellers,
   totalRevenue,
 } from "../services/shop-analysis.service";
-import { requireUser } from "../utils/current-user";
+import { requireShopId } from "../utils/current-user";
 
 export const CanceledOrderRateController: RequestHandler = async (req, res) => {
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const canceledOrders = await CanceledOrderRate(shopId);
   res
     .status(200)
@@ -25,7 +25,7 @@ export const OrderCountsByDateController: RequestHandler<
   { period: "daily" | "monthly" | "yearly" }
 > = async (req, res) => {
   const { period } = req.query;
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const ordersPerDate = await OrderCountsByDate(shopId, period);
   res
     .status(200)
@@ -34,7 +34,7 @@ export const OrderCountsByDateController: RequestHandler<
 
 export const SalesComparisonController: RequestHandler = async (req, res) => {
   const { start1, end1, start2, end2 } = req.query;
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const salesComparison = await SalesComparison(
     shopId,
     new Date(start1 as string),
@@ -52,7 +52,7 @@ export const BestAndWorstSellersController: RequestHandler = async (
   res,
 ) => {
   const { limit, startDate, endDate } = req.query;
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
 
   const BestAndWorstOrders = await BestAndWorstSellers(
     shopId,
@@ -67,7 +67,7 @@ export const BestAndWorstSellersController: RequestHandler = async (
 };
 
 export const TotalRevenueController: RequestHandler = async (req, res) => {
-  const { shopId } = requireUser(req);
+  const shopId = requireShopId(req);
   const totalRevenueForShop = await totalRevenue(shopId);
   res
     .status(200)

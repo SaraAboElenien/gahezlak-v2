@@ -2,6 +2,7 @@ import { Router } from "express";
 import * as subscriptionController from "../controllers/subscription.controller";
 import { protect, isAllowed } from "../middlewares/auth";
 import { Role } from "../models/Role";
+import { subscriptionIdParamValidator } from "../validators/subscription.validator";
 
 const router = Router();
 
@@ -21,6 +22,7 @@ router.get(
   "/:subscriptionId",
   protect,
   isAllowed([Role.ADMIN]),
+  subscriptionIdParamValidator,
   subscriptionController.getSubscriptionByIdHandler,
 );
 

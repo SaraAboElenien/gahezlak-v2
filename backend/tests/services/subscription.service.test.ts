@@ -15,6 +15,7 @@ import {
   clearTestDB,
 } from "../db-test-helper";
 import { Subscriptions, SubscriptionStatus } from "../../models/Subscription";
+import type { ISubscription } from "../../models/Subscription";
 import { Plans } from "../../models/Plan";
 import type { IPlan } from "../../models/Plan";
 import { Shops } from "../../models/Shop";
@@ -58,8 +59,14 @@ import { assertShopHasActiveSubscription } from "../../middlewares/subscription-
 // attempt a real HTTPS call to accept.paymob.com against whatever credentials
 // happen to be in the environment — i.e. it could cancel a real subscription.
 const cancelPaymobSubscriptionMock = vi.hoisted(() => vi.fn());
+// Stubbed for the same reason, and for one more: `createSubscriptionIntent` is
+// what actually starts billing a restaurant. The inactive-plan tests below
+// drive the real controller, and a handler that got past the guard would
+// otherwise open a live checkout.
+const createSubscriptionIntentMock = vi.hoisted(() => vi.fn());
 vi.mock("../../utils/paymob", () => ({
   cancelPaymobSubscription: cancelPaymobSubscriptionMock,
+  createSubscriptionIntent: createSubscriptionIntentMock,
 }));
 
 const SHOP_A = new mongoose.Types.ObjectId();
@@ -76,10 +83,32 @@ const nextSeq = () => ++fixtureSeq;
 
 const subscriptionService = () => import("../../services/subscription.service");
 
+/**
+ * Two small typing shims, both papering over declarations that live outside
+ * this file's scope rather than over anything this file does.
+ *
+ * `ISubscription` (models/Subscription.ts) does not declare `_id`, though every
+ * document the service returns carries one; and `IUser` declares its `_id` as
+ * `Schema.Types.ObjectId` rather than `Types.ObjectId`, which are structurally
+ * different types even though the runtime value is the same. Both are worth
+ * fixing at the model, which is why they are named here rather than hidden
+ * behind an untyped cast.
+ */
+const idOf = (doc: ISubscription): Types.ObjectId =>
+  (doc as unknown as { _id: Types.ObjectId })._id;
+const asObjectId = (id: unknown): Types.ObjectId => id as Types.ObjectId;
+
 async function seedPlan(overrides: Partial<IPlan> = {}): Promise<IPlan> {
+  // `planGroup` varies per fixture for the same reason `shops.name` and
+  // `users.email` do: (planGroup, frequency) now carries a unique index, so a
+  // second plan seeded at "Starter"/"monthly" is a duplicate-key error rather
+  // than a second plan. Nothing here asserts on the group — the tests that
+  // care about a plan's identity assert on `_id`, `title` or `price` — so the
+  // safe fixture is the distinct one.
+  const n = nextSeq();
   const plan = await Plans.create({
-    planGroup: "Starter",
-    title: `Starter monthly ${nextSeq()}`,
+    planGroup: `Starter ${n}`,
+    title: `Starter monthly ${n}`,
     description: "Test plan",
     frequency: "monthly",
     currency: "EGP",
@@ -171,7 +200,7 @@ async function seedListableSubscription(
 
   const subscription = await seedSubscription({
     shop: shop._id,
-    userId: user._id,
+    userId: asObjectId(user._id),
     plan: plan._id,
     status: opts.status ?? SubscriptionStatus.ACTIVE,
     createdAt: opts.createdAt,
@@ -188,6 +217,13 @@ async function seedListableSubscription(
 
 beforeAll(async () => {
   await connectTestDB();
+  // Not optional. Mongoose builds indexes in the background, so without this
+  // the unique (planGroup, frequency) index races the first inserts and the
+  // fixtures above pass or fail on scheduling rather than on the constraint.
+  // This project has already shipped a test that stayed green for weeks purely
+  // by winning that race (tests/models/subscription-entitlement.test.ts,
+  // 2026-08-24).
+  await Plans.init();
 });
 
 afterAll(async () => {
@@ -198,6 +234,9 @@ beforeEach(async () => {
   await clearTestDB();
   vi.clearAllMocks();
   cancelPaymobSubscriptionMock.mockResolvedValue({ success: true });
+  createSubscriptionIntentMock.mockResolvedValue({
+    iframeUrl: "https://accept.paymob.com/unified-checkout/?token=stub",
+  });
 });
 
 describe("createOrUpdatePendingSubscription — trial eligibility", () => {
@@ -890,7 +929,7 @@ describe("getAllSubscriptions", () => {
 
     const { subscriptions } = await getAllSubscriptions({});
 
-    expect(subscriptions.map((s) => s._id.toString())).toEqual([
+    expect(subscriptions.map((s) => idOf(s).toString())).toEqual([
       newest.subscription._id.toString(),
       oldest.subscription._id.toString(),
     ]);
@@ -937,77 +976,100 @@ describe("getAllSubscriptions", () => {
     // search usable at all, since none of the three fields is normalised.
     expect(subscriptions).toHaveLength(1);
     expect(totalCount).toBe(1);
-    expect(subscriptions[0]._id.toString()).toBe(
+    expect(idOf(subscriptions[0]).toString()).toBe(
       wanted.subscription._id.toString(),
     );
   });
 
   /**
-   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed.
+   * STALE COMMENT CORRECTED 2026-08-29. This block previously read "CURRENT
+   * BEHAVIOUR, not desired behaviour — reported, not fixed", claiming `search`
+   * was interpolated straight into `$regex`. It is not, and was not when that
+   * was written: `getAllSubscriptions` has passed the term through
+   * `escapeRegex` since before this session. The old assertion — searching "."
+   * and expecting both rows — could not tell the two apart, because every
+   * seeded email contains a literal dot too.
    *
-   * `search` is interpolated straight into `$regex`, so the admin's search box
-   * takes a regular expression rather than a literal string. "." matching every
-   * row is the harmless demonstration; the real costs are that searching for a
-   * literal email finds near-misses too, and that a pathological pattern is a
-   * ReDoS run server-side against three fields of every subscription. Admin-only
-   * and therefore low severity, but the fix is a one-line escape.
+   * So the term is now a metacharacter that only a *regex* would match with,
+   * and the expectation is that it matches nothing.
    */
-  it("treats the search term as a regular expression, not a literal", async () => {
+  it("treats the search term as a literal, not a regular expression", async () => {
     const { getAllSubscriptions } = await subscriptionService();
     await seedListableSubscription({ email: "a@example.com" });
     await seedListableSubscription({ email: "b@example.com" });
 
-    const { subscriptions, totalCount } = await getAllSubscriptions({
-      search: ".",
-    });
+    // Unescaped, `a.example` matches "a@example.com" — the `.` standing in for
+    // the `@`. Escaped, it is a literal that appears in neither address.
+    const asRegex = await getAllSubscriptions({ search: "a.example" });
+    expect(asRegex.subscriptions).toHaveLength(0);
+    expect(asRegex.totalCount).toBe(0);
 
-    expect(subscriptions).toHaveLength(2);
-    expect(totalCount).toBe(2);
+    // The control: the ordinary case still finds its row, so the escape has
+    // not simply broken searching.
+    const asLiteral = await getAllSubscriptions({ search: "a@example.com" });
+    expect(asLiteral.subscriptions).toHaveLength(1);
+    expect(asLiteral.totalCount).toBe(1);
   });
 
   /**
-   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed.
+   * REGRESSION — this test previously pinned the defect, under the name
+   * "silently drops a subscription whose shop no longer exists".
    *
    * The pipeline `$lookup`s users, shops and plans and then `$unwind`s all
-   * three, which is an inner join: a subscription whose user, shop or plan no
-   * longer resolves vanishes from the admin list entirely, and from the total
-   * alongside it. The list is at least self-consistent — the count pipeline
-   * reuses the same stages — but it is a revenue list that silently
-   * under-reports rather than showing a row with a missing name.
-   * `preserveNullAndEmptyArrays: true` on the three `$unwind`s is the fix.
+   * three. A bare `$unwind` is an inner join, so a subscription whose user,
+   * shop or plan no longer resolved vanished from the admin list entirely —
+   * and, because the count pipeline reuses every stage before the `$sort`,
+   * from `totalCount` alongside it. The list stayed self-consistent and simply
+   * under-reported, which is the dangerous shape: a revenue list missing rows
+   * looks exactly like a correct one, where a row with a missing name does
+   * not. The subscription remains billable throughout.
+   *
+   * `preserveNullAndEmptyArrays: true` on all three `$unwind`s makes them left
+   * joins. Asserted for a deleted shop *and* a deleted plan, because the three
+   * stages are separate and fixing one would not fix the others.
    */
-  it("silently drops a subscription whose shop no longer exists", async () => {
+  it("keeps a subscription whose shop or plan no longer exists", async () => {
     const { getAllSubscriptions } = await subscriptionService();
-    await seedListableSubscription();
-    const orphan = await seedListableSubscription();
-    await Shops.deleteOne({ _id: orphan.shop._id });
+    const intact = await seedListableSubscription();
+    const shopless = await seedListableSubscription();
+    const planless = await seedListableSubscription();
+    await Shops.deleteOne({ _id: shopless.shop._id });
+    await Plans.deleteOne({ _id: planless.plan._id });
 
     const { subscriptions, totalCount } = await getAllSubscriptions({});
 
-    expect(subscriptions).toHaveLength(1);
-    expect(totalCount).toBe(1);
+    expect(totalCount).toBe(3);
+    expect(subscriptions.map((s) => idOf(s).toString()).sort()).toEqual(
+      [intact, shopless, planless]
+        .map((s) => s.subscription._id.toString())
+        .sort(),
+    );
+    // The dangling reference is absent rather than nulled — that is what
+    // `preserveNullAndEmptyArrays` does — so the admin UI renders a row with a
+    // missing name instead of losing the row.
+    const byId = new Map(subscriptions.map((s) => [idOf(s).toString(), s]));
+    expect(
+      byId.get(shopless.subscription._id.toString())!.shop,
+    ).toBeUndefined();
+    expect(
+      byId.get(planless.subscription._id.toString())!.plan,
+    ).toBeUndefined();
+    expect(byId.get(intact.subscription._id.toString())!.shop).toBeDefined();
     // Still very much in the database, and still billable.
-    await expect(Subscriptions.countDocuments()).resolves.toBe(2);
+    await expect(Subscriptions.countDocuments()).resolves.toBe(3);
   });
 
   /**
-   * DEFECT MARKER — do not delete; un-skip when the source is fixed.
-   *
-   * `userId` and `planId` arrive from the query string as strings and are put
-   * into a `$match` unchanged. `Model.aggregate()` performs no schema casting —
-   * unlike `find()`, which casts the same string to an ObjectId happily — so
-   * the stage compares a string against an ObjectId and matches nothing, ever.
-   * Verified against the real driver.
-   *
-   * Both admin filters therefore return an empty list with `totalCount: 0` for
-   * every input, including correct ones. It reads as "this customer has no
-   * subscriptions" rather than as an error, which is the worst possible
-   * failure mode for a support tool: the answer looks authoritative. `status`
-   * is unaffected, being a string in the schema too, which is presumably why
-   * the endpoint appears to work.
-   *
-   * The fix is to cast in the service — `new mongoose.Types.ObjectId(userId)`
-   * — as anything building a `$match` by hand must.
+   * STALE MARKER CORRECTED 2026-08-29. This carried a "DEFECT MARKER — un-skip
+   * when the source is fixed" describing both filters as permanently broken.
+   * The defect was real and is the reason the test exists: `userId` and
+   * `planId` arrive as strings, `Model.aggregate()` performs no schema casting
+   * (unlike `find()`), so an uncast `$match` compares a string against a stored
+   * ObjectId and matches nothing, ever — returning `totalCount: 0` for correct
+   * input, which reads as "this customer has no subscriptions" rather than as
+   * an error. But `subscription.service.ts` has cast both through `toObjectId`
+   * since before this session, and this test asserts the fixed behaviour; only
+   * the comment was left behind. Kept as the regression test.
    */
   it("filters by userId and by planId", async () => {
     const { getAllSubscriptions } = await subscriptionService();
@@ -1071,17 +1133,146 @@ describe("getSubscriptionById", () => {
   });
 
   /**
-   * CURRENT BEHAVIOUR, not desired behaviour — reported, not fixed.
+   * REGRESSION — this test previously pinned the defect, asserting only that
+   * *something* was thrown.
    *
-   * A malformed id reaches `findById` uncast and Mongoose throws a CastError,
-   * which is not a `CustomError` — so the handler's "null means 404" path is
-   * never taken and the error middleware falls through to a 500. A mistyped URL
-   * in the admin panel reports a server fault rather than "not found"; it also
-   * means the route has no id validation at all.
+   * A malformed id used to reach `findById` uncast, so Mongoose threw a
+   * CastError. A CastError is not a `CustomError` and is not one of the shapes
+   * the global error handler names, so the handler's "null means 404" path was
+   * never taken and the middleware fell through to a 500 plus a Sentry event:
+   * a mistyped id in the admin panel reported a server fault rather than a bad
+   * request. `getSubscriptionById` now casts through the same `toObjectId`
+   * helper the two `$match` filters use, and the route carries
+   * `subscriptionIdParamValidator` besides — two layers answering two
+   * different callers.
+   *
+   * The distinction the old assertion could not make is the whole point:
+   * `rejects.toThrow()` passes for a CastError *and* for a typed 400, so it
+   * would have stayed green through the bug and through the fix alike.
    */
-  it("throws rather than returning null for a malformed id", async () => {
+  it("refuses a malformed id as a 400 rather than raising a 500", async () => {
     const { getSubscriptionById } = await subscriptionService();
 
-    await expect(getSubscriptionById("not-an-object-id")).rejects.toThrow();
+    const err = await getSubscriptionById("not-an-object-id").then(
+      () => null,
+      (e: unknown) => e as { name: string; statusCode?: number },
+    );
+
+    expect(err).not.toBeNull();
+    expect(err!.name).not.toBe("CastError");
+    expect(err!.statusCode).toBe(400);
+  });
+
+  it("still returns the subscription for a well-formed id", async () => {
+    // The other direction of the cast: a guard that rejected everything would
+    // pass the test above and take the admin detail view down.
+    const { getSubscriptionById } = await subscriptionService();
+    const { subscription } = await seedListableSubscription();
+
+    const found = await getSubscriptionById(subscription._id.toString());
+
+    expect(idOf(found!).toString()).toBe(subscription._id.toString());
+  });
+});
+
+/**
+ * The controller, not the service, is where "this plan is no longer on sale"
+ * has to be enforced — so it is tested here rather than left to the plan
+ * service's listing tests, which only prove a retired plan is hidden.
+ *
+ * Hiding is not refusing. `getPlanById` deliberately still returns a
+ * deactivated plan (an admin has to be able to fetch one in order to put it
+ * back on sale), and `POST /subscriptions` takes a `planId` straight from the
+ * request body — so before this guard, any link, bookmark or curl carrying a
+ * retired plan's id still sold that plan, at a price we had stopped offering,
+ * and `createSubscriptionIntent` opened a real Paymob checkout for it.
+ */
+describe("createSubscriptionHandler — plans that are no longer on sale", () => {
+  const controller = () => import("../../controllers/subscription.controller");
+
+  async function seedOwnerWithShop() {
+    const n = nextSeq();
+    const user = await Users.create({
+      firstName: "Owner",
+      lastName: `Number${n}`,
+      email: `owner${n}@example.com`,
+      password: "irrelevant-hash",
+      phoneNumber: "01000000000",
+      role: new mongoose.Types.ObjectId(),
+      shop: new mongoose.Types.ObjectId(),
+    });
+    return user;
+  }
+
+  /**
+   * Drives the real handler with the smallest request/response pair it reads.
+   * The handler is `async` and throws rather than calling `next`, so the error
+   * surfaces as a rejected promise — which is how the app's async error
+   * middleware sees it too.
+   */
+  async function callHandler(userId: string, planId: string) {
+    const { createSubscriptionHandler } = await controller();
+    const json = vi.fn();
+    const status = vi.fn(() => ({ json }));
+    const invoke = createSubscriptionHandler as unknown as (
+      req: unknown,
+      res: unknown,
+      next: unknown,
+    ) => Promise<void>;
+
+    const error = await invoke(
+      { body: { planId }, user: { userId } },
+      { status },
+      vi.fn(),
+    ).then(
+      () => null,
+      (e: unknown) => e as { message: string; statusCode?: number },
+    );
+
+    return { error, status, json };
+  }
+
+  it("refuses to sell a deactivated plan, and starts no checkout", async () => {
+    const owner = await seedOwnerWithShop();
+    const retired = await seedPlan({ isActive: false });
+
+    const { error } = await callHandler(
+      owner._id.toString(),
+      retired._id.toString(),
+    );
+
+    expect(error?.message).toBe(errMsg.PLAN_INACTIVE.en);
+    expect(error?.statusCode).toBe(400);
+    // The two things that must not have happened: no pending row written
+    // against the retired plan, and no Paymob intention created for it.
+    await expect(Subscriptions.countDocuments()).resolves.toBe(0);
+    expect(createSubscriptionIntentMock).not.toHaveBeenCalled();
+  });
+
+  it("still sells a plan that is on sale", async () => {
+    // The other direction. A guard that refused everything would pass the test
+    // above and take the entire subscribe flow down — and this project has
+    // shipped exactly that shape of regression before (the `updateShop`
+    // allowlist that silently stripped `type` and `logoUrl`).
+    const owner = await seedOwnerWithShop();
+    const live = await seedPlan({ isActive: true });
+
+    const { error, status, json } = await callHandler(
+      owner._id.toString(),
+      live._id.toString(),
+    );
+
+    expect(error).toBeNull();
+    expect(status).toHaveBeenCalledWith(200);
+    expect(json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { iframeUrl: expect.stringContaining("accept.paymob.com") },
+      }),
+    );
+    expect(createSubscriptionIntentMock).toHaveBeenCalledTimes(1);
+    // PENDING, not TRIALING or ACTIVE: the row exists only because the owner
+    // was sent to checkout.
+    const written = await Subscriptions.findOne({ plan: live._id }).lean();
+    expect(written?.status).toBe(SubscriptionStatus.PENDING);
   });
 });

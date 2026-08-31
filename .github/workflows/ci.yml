@@ -53,9 +53,9 @@ jobs:
       # Point it at a stable, cacheable directory outside node_modules instead.
       MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -66,7 +66,7 @@ jobs:
       # naturally invalidates the cache; the restore-keys prefix lets an otherwise
       # unrelated lockfile change still reuse the existing binary.
       - name: Cache mongodb-memory-server binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.cache/mongodb-binaries
           key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('backend/package-lock.json') }}
@@ -106,7 +106,7 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Page weight is a product requirement here, not a cosmetic one: the core
       # use case is a customer scanning a QR code on mobile data, at a table, in
@@ -140,7 +140,7 @@ jobs:
           if [ "$status" -eq 0 ]; then echo "All images within the ${LIMIT_KB}KB budget."; fi
           exit $status
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm

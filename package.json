@@ -26,7 +26,7 @@
     "@playwright/test": "^1.62.1",
     "husky": "^9.1.7",
     "jsqr": "^1.4.0",
-    "lint-staged": "^16.2.7",
+    "lint-staged": "^17.4.1",
     "mongodb-memory-server": "^11.2.0",
     "prettier": "^3.6.2",
     "sharp": "^0.35.4",
